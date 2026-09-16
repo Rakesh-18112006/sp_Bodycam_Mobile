@@ -8,7 +8,7 @@ plugins {
 android {
     namespace = "com.policebodycam.police_body_cam"
     // flutter_secure_storage requires compileSdk 37+.
-    compileSdk = maxOf(flutter.compileSdkVersion, 37)
+    compileSdk = maxOf(flutter.compileSdkVersion, 35)
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

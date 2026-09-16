@@ -36,14 +36,33 @@ dependencies:
   cupertino_icons: ^1.0.8
   livekit_client: ^2.11.0
   http: ^1.6.0
-  flutter_secure_storage: ^11.0.0
-  permission_handler: ^11.3.1
+  http_parser: ^4.1.2
+  flutter_secure_storage: ^9.2.2
   web_socket_channel: ^3.0.3
   uuid: ^4.6.0
+
+  # --- Body-camera recording stack -----------------------------------------
+  camera: ^0.11.1               # real Android Camera2-backed video+audio recording
+  path_provider: ^2.1.5         # per-app local storage for recorded segments
+  path: ^1.9.1
+  sqflite: ^2.4.2                # persistent offline chunk-upload queue + session recovery
+  geolocator: ^13.0.4            # real GPS location reporting
+  battery_plus: ^6.2.1           # real battery percentage / charging state
+  flutter_foreground_task: ^11.0.3  # Android foreground service so recording survives backgrounding
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  # Desktop/FFI SQLite backend used only by unit tests (test/services/
+  # chunk_queue_test.dart, recording_service_test.dart) to exercise sqflite
+  # code without a real Android device. Never used by the Android app
+  # itself (that uses sqflite_android's own SQLite).
+  sqflite_common_ffi: ^2.3.4+4
+  # Used only by test/services/command_listener_reconnect_test.dart to build
+  # a fake WebSocketChannel (StreamChannelMixin) -- already a transitive
+  # dependency of web_socket_channel, declared directly here since a test
+  # imports it explicitly.
+  stream_channel: ^2.1.4
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
