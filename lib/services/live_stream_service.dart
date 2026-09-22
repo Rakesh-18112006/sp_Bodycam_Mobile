@@ -33,7 +33,33 @@ class LiveStreamService {
     _cameraPosition = cameraPosition;
 
     final room = Room();
-    await room.connect(result['livekit_url'], result['token']);
+    // Real physical-device testing (Docker Desktop/WSL2 host + a phone on
+    // the host's own mobile hotspot) found the underlying ICE/PeerConnection
+    // negotiation genuinely succeeding -- confirmed via livekit-server logs
+    // showing a healthy, low-RTT connection -- but only ~20-30s after
+    // connect() was called, well past livekit_client's own default 10s
+    // ConnectOptions.timeouts.connection (see engine.dart's
+    // "Timed out waiting for PeerConnection to connect" check). The Dart
+    // call was throwing MediaConnectException before the real, working
+    // connection had a chance to finish, discarding a Room the SDK's own
+    // native layer had already connected. Raising just this timeout (still
+    // the SDK's own documented, public ConnectOptions knob -- nothing about
+    // ICE/STUN/TURN behavior itself is changed) gives slower real-world
+    // networks enough time without masking a genuine failure indefinitely.
+    await room.connect(
+      result['livekit_url'],
+      result['token'],
+      connectOptions: const ConnectOptions(
+        timeouts: Timeouts(
+          connection: Duration(seconds: 30),
+          debounce: Duration(milliseconds: 20),
+          publish: Duration(seconds: 10),
+          subscribe: Duration(seconds: 10),
+          peerConnection: Duration(seconds: 10),
+          iceRestart: Duration(seconds: 10),
+        ),
+      ),
+    );
     // Publishes the camera (and requests the OS camera/mic permission the
     // first time) -- this is the ONLY thing being sent; nothing is written
     // to local storage. Deliberately NOT passing cameraCaptureOptions here

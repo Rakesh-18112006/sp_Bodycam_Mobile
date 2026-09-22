@@ -33,7 +33,7 @@ class OfflineQueueService {
     final dbPath = await getDatabasesPath();
     _db = await openDatabase(
       p.join(dbPath, databaseName),
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE recording_sessions (
@@ -58,9 +58,26 @@ class OfflineQueueService {
             upload_state TEXT NOT NULL DEFAULT 'pending',
             retry_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
+            latitude REAL,
+            longitude REAL,
+            recorded_at TEXT,
             UNIQUE(local_session_id, chunk_number)
           )
         ''');
+      },
+      // v1 -> v2: adds the GPS/timestamp-watermark columns (see
+      // QueuedChunk's doc comment). A real device upgrading from a v1
+      // install keeps its existing queued rows -- ALTER TABLE ADD COLUMN
+      // is safe/non-destructive in SQLite, and the new columns are
+      // nullable, so any chunk already queued before this upgrade simply
+      // has no GPS/timestamp metadata (matching its real capture history --
+      // it genuinely predates this feature).
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute('ALTER TABLE chunk_queue ADD COLUMN latitude REAL');
+          await db.execute('ALTER TABLE chunk_queue ADD COLUMN longitude REAL');
+          await db.execute('ALTER TABLE chunk_queue ADD COLUMN recorded_at TEXT');
+        }
       },
     );
     return _db!;

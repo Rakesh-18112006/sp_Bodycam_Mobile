@@ -20,6 +20,7 @@ enum LocationAvailability {
 /// honest status instead of silently pretending location works.
 class LocationService {
   StreamSubscription<Position>? _positionSub;
+  Timer? _periodicResendTimer;
   LocationAvailability availability = LocationAvailability.unknown;
   GpsFix? lastFix;
 
@@ -74,7 +75,7 @@ class LocationService {
     // stream events at all -- without this, Control Room would see
     // location_updated_at go stale the moment a constable stops moving,
     // which is exactly the false impression the handoff doc warns against.
-    Timer.periodic(const Duration(seconds: 60), (_) async {
+    _periodicResendTimer = Timer.periodic(const Duration(seconds: 60), (_) async {
       if (_positionSub == null) return;
       try {
         final pos = await Geolocator.getLastKnownPosition();
@@ -109,5 +110,7 @@ class LocationService {
   void stop() {
     _positionSub?.cancel();
     _positionSub = null;
+    _periodicResendTimer?.cancel();
+    _periodicResendTimer = null;
   }
 }

@@ -5,6 +5,7 @@ import 'services/auth_service.dart';
 import 'services/recording_service.dart';
 import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
+import 'theme/app_theme.dart';
 
 /// Root navigator key so the centralized 401 handler (see
 /// HomeScreen._installGlobalUnauthorizedHandler) can return to the login
@@ -62,7 +63,7 @@ class _PoliceBodyCamAppState extends State<PoliceBodyCamApp> {
     return MaterialApp(
       navigatorKey: rootNavigatorKey,
       title: 'Police Body Camera',
-      theme: ThemeData(colorSchemeSeed: Colors.red, useMaterial3: true),
+      theme: buildAppTheme(),
       home: FutureBuilder<bool>(
         future: _bootstrapFuture,
         builder: (context, snapshot) {

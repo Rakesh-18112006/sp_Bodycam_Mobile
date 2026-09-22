@@ -40,7 +40,19 @@ const kNetworkTimeout = Duration(seconds: 30);
 /// eventually fail and be retried rather than hang forever (see
 /// [kNetworkTimeout]'s doc comment for why an unbounded hang here is
 /// actively dangerous, not just slow).
-const kUploadTimeout = Duration(seconds: 60);
+///
+/// 60s (the original value) was calibrated against a fast local/USB
+/// connection and was found, via a real public-Internet (Cloudflare
+/// Tunnel + mobile data) reproduction, to be tight for a full-size video
+/// segment on genuine mobile upload speeds -- a chunk that is still
+/// legitimately in flight at 60s is aborted and retried rather than
+/// allowed to finish, which both wastes the upload and (see
+/// chunk_uploader.dart's drain() doc comment) widens the window for a
+/// since-fixed concurrency race between the periodic pump timer and
+/// RecordingEngine.stop()'s final-chunk enqueue. 120s is a deliberately
+/// bounded increase -- not "huge" -- sized for one realistic worst-case
+/// segment over slow cellular, not an unbounded/infinite wait.
+const kUploadTimeout = Duration(seconds: 120);
 
 /// Small storage seam so tests can swap in an in-memory fake instead of
 /// hitting the real platform keystore (which has no implementation inside
@@ -228,14 +240,18 @@ class ApiClient {
     } catch (_) {
       // Non-JSON error body -- fall back to the generic message above.
     }
-    throw ApiException(response.statusCode, detail);
+    throw ApiException(response.statusCode, detail, headers: response.headers);
   }
 }
 
 class ApiException implements Exception {
   final int statusCode;
   final String detail;
-  ApiException(this.statusCode, this.detail);
+  // Raw response headers (see chunk_uploader.dart's use of [conflictReason]
+  // below) -- package:http lowercases header names, so lookups here must
+  // always use lowercase keys.
+  final Map<String, String>? headers;
+  ApiException(this.statusCode, this.detail, {this.headers});
 
   bool get isConflict => statusCode == 409;
   bool get isPayloadTooLarge => statusCode == 413;
@@ -243,6 +259,14 @@ class ApiException implements Exception {
   bool get isUnauthorized => statusCode == 401;
   bool get isForbidden => statusCode == 403;
   bool get isNotFound => statusCode == 404;
+
+  /// Only meaningful when [isConflict] -- see
+  /// backend/app/routers/recordings.py::upload_chunk's X-Conflict-Reason
+  /// header and chunk_uploader.dart's handling of it. Null for a 409 from
+  /// an older backend that doesn't send this header, or for any endpoint
+  /// that doesn't set it -- callers must treat null as "unknown reason",
+  /// never assume it means "duplicate".
+  String? get conflictReason => headers?['x-conflict-reason'];
 
   @override
   String toString() => detail;

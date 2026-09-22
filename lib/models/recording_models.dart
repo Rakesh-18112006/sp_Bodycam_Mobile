@@ -39,6 +39,16 @@ class RecordingSessionResponse {
   final int chunkCount;
   final int? highestChunkNumber;
   final List<int> missingChunkNumbers;
+  // "not_ready" | "building" | "ready" | "failed" -- mirrors
+  // backend/app/schemas.py::RecordingSessionResponse.playable_status
+  // exactly. "ready" is the only value for which GET /recordings/{id}/play
+  // will actually return media.
+  final String playableStatus;
+  // "front" | "back" -- the lens actually used for this whole session (set
+  // once at /recordings/start). Shown on the Recording Details screen and
+  // matches the "CAMERA: ..." text the backend burns into this
+  // recording's video frames (see _burn_watermark_best_effort).
+  final String cameraLensDirection;
 
   RecordingSessionResponse({
     required this.id,
@@ -53,6 +63,8 @@ class RecordingSessionResponse {
     required this.chunkCount,
     required this.highestChunkNumber,
     required this.missingChunkNumbers,
+    this.playableStatus = 'not_ready',
+    this.cameraLensDirection = 'back',
   });
 
   factory RecordingSessionResponse.fromJson(Map<String, dynamic> json) => RecordingSessionResponse(
@@ -68,6 +80,8 @@ class RecordingSessionResponse {
         chunkCount: json['chunk_count'] as int? ?? 0,
         highestChunkNumber: json['highest_chunk_number'] as int?,
         missingChunkNumbers: (json['missing_chunk_numbers'] as List<dynamic>? ?? const []).map((e) => e as int).toList(),
+        playableStatus: json['playable_status'] as String? ?? 'not_ready',
+        cameraLensDirection: json['camera_lens_direction'] as String? ?? 'back',
       );
 }
 
@@ -149,6 +163,15 @@ enum RecordingLifecycleState {
   starting,
   startFailed,
   recording,
+  // Camera capture is deliberately, proactively paused because the app
+  // left the foreground -- the CURRENT segment was already gracefully
+  // finalized and queued for upload (a real, valid, non-final chunk of
+  // the SAME recording session), and a new segment starts the instant the
+  // app returns to the foreground (see RecordingService.resumeFromBackground).
+  // Distinct from [offline] (camera still running, only the network is
+  // down) and from [uploading]/[completing] (an explicit stop is in
+  // progress) -- this state means capture itself is paused, nothing else.
+  backgroundPaused,
   uploading,
   offline,
   completing,
@@ -173,6 +196,16 @@ class QueuedChunk {
   final String uploadState; // pending | uploading | uploaded | failed
   final int retryCount;
   final DateTime createdAt;
+  // Real GPS fix (from LocationService.lastFix, captured the moment this
+  // segment finished -- see RecordingService._handleSegmentReady) and the
+  // segment's own actual start time, both persisted here so they survive
+  // offline queueing/retry/app-restart and are sent to the backend with
+  // this exact chunk whenever it eventually uploads (see
+  // chunk_uploader.dart). Null latitude/longitude means GPS was genuinely
+  // unavailable at capture time -- never a fabricated coordinate.
+  final double? latitude;
+  final double? longitude;
+  final DateTime? recordedAt;
 
   static const statePending = 'pending';
   static const stateUploading = 'uploading';
@@ -190,6 +223,9 @@ class QueuedChunk {
     required this.uploadState,
     required this.retryCount,
     required this.createdAt,
+    this.latitude,
+    this.longitude,
+    this.recordedAt,
   });
 
   QueuedChunk copyWith({int? id, String? backendSessionId, String? uploadState, int? retryCount}) => QueuedChunk(
@@ -203,6 +239,9 @@ class QueuedChunk {
         uploadState: uploadState ?? this.uploadState,
         retryCount: retryCount ?? this.retryCount,
         createdAt: createdAt,
+        latitude: latitude,
+        longitude: longitude,
+        recordedAt: recordedAt,
       );
 
   Map<String, dynamic> toDb() => {
@@ -216,6 +255,9 @@ class QueuedChunk {
         'upload_state': uploadState,
         'retry_count': retryCount,
         'created_at': createdAt.toIso8601String(),
+        'latitude': latitude,
+        'longitude': longitude,
+        'recorded_at': recordedAt?.toIso8601String(),
       };
 
   factory QueuedChunk.fromDb(Map<String, dynamic> row) => QueuedChunk(
@@ -229,6 +271,9 @@ class QueuedChunk {
         uploadState: row['upload_state'] as String,
         retryCount: row['retry_count'] as int,
         createdAt: DateTime.parse(row['created_at'] as String),
+        latitude: (row['latitude'] as num?)?.toDouble(),
+        longitude: (row['longitude'] as num?)?.toDouble(),
+        recordedAt: row['recorded_at'] == null ? null : DateTime.parse(row['recorded_at'] as String),
       );
 }
 

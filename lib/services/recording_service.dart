@@ -1,6 +1,11 @@
 import 'dart:async';
+import 'dart:io';
+import 'package:camera/camera.dart' show CameraController, CameraLensDirection;
 import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+import '../models/location_models.dart';
 import '../models/recording_models.dart';
 import 'api_client.dart';
 import 'chunk_uploader.dart';
@@ -17,11 +22,18 @@ class RecordingApi {
     required String deviceIdentifier,
     required TriggerType triggerType,
     String? incidentId,
+    CameraLensDirection cameraLensDirection = CameraLensDirection.back,
   }) async {
     final result = await ApiClient.post('/recordings/start', body: {
       'device_identifier': deviceIdentifier,
       'trigger_type': triggerType.wire,
       if (incidentId != null) 'incident_id': incidentId,
+      // CameraLensDirection.name is already exactly "front"/"back"/"external";
+      // the backend only accepts the first two (see
+      // routers/recordings.py::start_recording), so an "external" lens
+      // (not something this app's UI ever offers, but defensively handled)
+      // falls back to "back" rather than sending a value the backend would 422 on.
+      'camera_lens_direction': cameraLensDirection == CameraLensDirection.front ? 'front' : 'back',
     });
     return RecordingSessionResponse.fromJson(result as Map<String, dynamic>);
   }
@@ -86,10 +98,32 @@ class RecordingService {
   RecordingLifecycleState state = RecordingLifecycleState.idle;
   List<int> lastMissingChunkNumbers = const [];
   DateTime? recordingStartedAt;
+  // The trigger/camera actually in effect for the CURRENT recording
+  // attempt (set once, at the top of start(), read by the UI for the
+  // Go-Live-style recording view -- see home_screen.dart). Distinct from
+  // the [cameraLensDirection] parameter passed into start() itself, which
+  // only the caller sees -- this is what the rest of the service (and the
+  // UI) reads afterward.
+  TriggerType? activeTriggerType;
+  CameraLensDirection _activeCameraLensDirection = CameraLensDirection.back;
+
+  /// Read-only passthrough so the UI can render a REAL, live
+  /// `CameraPreview(controller)` -- see RecordingEngine.controller's doc
+  /// comment. Null whenever no engine is active.
+  CameraController? get cameraController => _engine?.controller;
 
   final void Function(RecordingLifecycleState state)? onStateChanged;
   final void Function({required int uploaded, required int pending, required int failed})? onProgress;
   final void Function(Object error)? onError;
+
+  /// Reads the app's EXISTING cached GPS fix (see location_service.dart's
+  /// LocationService.lastFix) at the moment each segment finishes, so it
+  /// can be attached to that chunk's upload -- never a new GPS
+  /// poll/request of its own. Null when the caller has no location service
+  /// wired up, or when GPS is genuinely unavailable right now; either way
+  /// this is passed straight through to the backend as "unavailable"
+  /// rather than a fabricated coordinate (see chunk_uploader.dart).
+  final GpsFix? Function()? locationProvider;
 
   RecordingService({
     required this.deviceIdentifier,
@@ -98,6 +132,7 @@ class RecordingService {
     this.onStateChanged,
     this.onProgress,
     this.onError,
+    this.locationProvider,
   }) {
     _uploader = ChunkUploader(
       onChunkUploaded: (_) => _reportProgress(),
@@ -121,6 +156,7 @@ class RecordingService {
 
   bool get isActive => state == RecordingLifecycleState.starting ||
       state == RecordingLifecycleState.recording ||
+      state == RecordingLifecycleState.backgroundPaused ||
       state == RecordingLifecycleState.uploading ||
       state == RecordingLifecycleState.offline ||
       state == RecordingLifecycleState.completing;
@@ -129,7 +165,12 @@ class RecordingService {
   // Start
   // ---------------------------------------------------------------------
 
-  Future<void> start({required TriggerType triggerType}) async {
+  /// [cameraLensDirection] defaults to back -- unchanged existing behavior
+  /// for every call site that doesn't explicitly pass it. Only the
+  /// emergency-trigger UI currently passes front, per the constable's own
+  /// selection (see home_screen.dart) -- never remembered/reused beyond
+  /// that one call.
+  Future<void> start({required TriggerType triggerType, CameraLensDirection cameraLensDirection = CameraLensDirection.back}) async {
     if (isActive) return; // one recording at a time; the UI must not offer Start while already active
     _stopRequested = false;
     _cancelRequested = false;
@@ -138,6 +179,8 @@ class RecordingService {
     _localSessionId = const Uuid().v4();
     _backendSessionId = null;
     recordingStartedAt = DateTime.now();
+    activeTriggerType = triggerType;
+    _activeCameraLensDirection = cameraLensDirection;
     _setState(RecordingLifecycleState.starting);
 
     await OfflineQueueService.upsertSession(LocalRecordingSession(
@@ -190,7 +233,7 @@ class RecordingService {
     );
 
     try {
-      await _engine!.start(localSessionId: _localSessionId!);
+      await _engine!.start(localSessionId: _localSessionId!, lensDirection: cameraLensDirection);
     } catch (e) {
       // Camera/microphone permission denied, no camera hardware, or the
       // platform genuinely failed to start -- this MUST surface as
@@ -205,6 +248,28 @@ class RecordingService {
         startedAt: recordingStartedAt!,
         endedAt: DateTime.now(),
       ));
+      // REAL BUG, physically reproduced (11 stuck RecordingSession rows
+      // found server-side, several created mere milliseconds-to-seconds
+      // apart on the same device): _resolveBackendSession above may have
+      // already created and committed a backend RecordingSession (status
+      // "recording") before the camera itself failed to start here -- e.g.
+      // a double-trigger race (manual button + emergency volume gesture
+      // firing within the same window), the camera already being held by
+      // another attempt, or a genuine hardware/permission failure. Without
+      // this, that backend session is never told the truth: it sits at
+      // status="recording" with zero chunks forever, indistinguishable
+      // server-side from a device that is still actively (but silently)
+      // recording -- exactly the "stuck recording" symptom reported from
+      // real Internet testing. Best-effort and never allowed to change the
+      // outcome the constable sees (still STARTFAILED either way): if this
+      // cancel call itself fails (offline, already-changed session state,
+      // etc.), the session remains an orphan to be cleaned up separately,
+      // but this closes the common case.
+      if (_backendSessionId != null) {
+        try {
+          await RecordingApi.cancel(_backendSessionId!);
+        } catch (_) {}
+      }
       onError?.call(e);
       return;
     }
@@ -231,13 +296,32 @@ class RecordingService {
   /// a fresh RecordingSession row), so blindly retrying it after a timeout
   /// whose response we never saw could create a duplicate session that
   /// silently fragments the constable's evidence across two IDs. Checking
-  /// GET /recordings/?device_id=&status=recording first closes that gap.
+  /// GET /recordings/?device_id=&status=recording first closes that gap --
+  /// BUT only ever adopts a session that is plausibly OUR OWN lost-response
+  /// retry of THIS exact attempt, never an unrelated session left
+  /// "recording" server-side by a previous crash/kill that
+  /// recoverOnStartup hasn't reconciled yet. A genuine lost-response retry
+  /// would be for the identical trigger_type/camera we're starting with
+  /// right now, AND created within a realistic single-request retry
+  /// window of our own recordingStartedAt (kNetworkTimeout is 30s; 60s
+  /// gives a safe margin without reaching into "minutes/hours-old orphan"
+  /// territory). Real bug found via physical device testing: without this
+  /// filter, a fresh emergency-trigger recording silently adopted and
+  /// later completed an unrelated stale session instead of creating (and
+  /// completing) its own -- see docs/physical-verification notes.
   Future<void> _resolveBackendSession(TriggerType triggerType) async {
     if (_backendSessionId != null) return;
     try {
       final active = await RecordingApi.listActiveForDevice(deviceId);
-      if (active.isNotEmpty) {
-        _backendSessionId = active.first.id;
+      final wantCamera = _activeCameraLensDirection == CameraLensDirection.front ? 'front' : 'back';
+      const retryWindow = Duration(seconds: 60);
+      final ownRetry = active.where((s) =>
+          s.triggerType == triggerType &&
+          s.cameraLensDirection == wantCamera &&
+          recordingStartedAt != null &&
+          s.createdAt.difference(recordingStartedAt!).abs() <= retryWindow);
+      if (ownRetry.isNotEmpty) {
+        _backendSessionId = ownRetry.first.id;
         await OfflineQueueService.setBackendSessionIdForSession(_localSessionId!, _backendSessionId!);
         return;
       }
@@ -249,7 +333,11 @@ class RecordingService {
       // on the network, the caller's catch-all handles it the same way.
     }
 
-    final session = await RecordingApi.start(deviceIdentifier: deviceIdentifier, triggerType: triggerType);
+    final session = await RecordingApi.start(
+      deviceIdentifier: deviceIdentifier,
+      triggerType: triggerType,
+      cameraLensDirection: _activeCameraLensDirection,
+    );
     _backendSessionId = session.id;
     await OfflineQueueService.setBackendSessionIdForSession(_localSessionId!, _backendSessionId!);
   }
@@ -259,6 +347,9 @@ class RecordingService {
   // ---------------------------------------------------------------------
 
   Future<void> _handleSegmentReady(RecordingSegment segment) async {
+    // Existing cached fix only -- never a fresh GPS request per segment
+    // (see locationProvider's doc comment above).
+    final fix = locationProvider?.call();
     final chunk = QueuedChunk(
       localSessionId: _localSessionId!,
       backendSessionId: _backendSessionId,
@@ -269,6 +360,9 @@ class RecordingService {
       uploadState: QueuedChunk.statePending,
       retryCount: 0,
       createdAt: DateTime.now(),
+      latitude: fix?.latitude,
+      longitude: fix?.longitude,
+      recordedAt: segment.startedAt,
     );
     await OfflineQueueService.enqueueChunk(chunk);
     debugPrint('[bodycam] chunk ${chunk.chunkNumber} queued for session=${_backendSessionId ?? "(unresolved)"}');
@@ -281,7 +375,31 @@ class RecordingService {
       _setState(RecordingLifecycleState.uploading);
     }
 
-    await _pump();
+    // REAL BUG FIXED HERE, found via physical testing: this used to be
+    // `await _pump()`, which -- especially for the final segment -- can
+    // take as long as the ENTIRE remaining upload queue takes to drain
+    // (many chunks, each tens of seconds on real mobile Internet). Since
+    // RecordingEngine's native "stop" MethodChannel result (and therefore
+    // RecordingEngine.stop(), and therefore RecordingService.stop(), and
+    // therefore whatever UI/remote-command code called stop() in the first
+    // place) is held open until THIS callback (onSegmentReady) returns
+    // (see RecordingEngine._handleNativeCall's isLast branch), awaiting
+    // the full pump/drain cycle here meant STOP itself did not visibly
+    // complete until every historical chunk had finished uploading --
+    // exactly the "app continues appearing to record" symptom reported
+    // from real Internet testing, where a single chunk upload can take
+    // 20-40s and there can be several queued.
+    //
+    // The camera has ALREADY physically stopped by the time this runs
+    // (CameraX Finalize already fired -- see NativeRecordingManager.kt).
+    // The only thing that must complete before this method returns is the
+    // enqueue above (durably persisting the chunk -- already done) and the
+    // state transition (already done). Actually driving the upload queue
+    // and checking for completion is a background concern from here on:
+    // fire it off without blocking, backed by the still-running
+    // _pumpTimer (unchanged, still ticks independently) as the safety net
+    // if this particular call encounters a transient failure.
+    unawaited(_pump().catchError((Object e) => onError?.call(e)));
   }
 
   // ---------------------------------------------------------------------
@@ -339,9 +457,10 @@ class RecordingService {
       final allChunks = await OfflineQueueService.allChunksForSession(_localSessionId!);
       final allUploaded = allChunks.isNotEmpty && allChunks.every((c) => c.uploadState == QueuedChunk.stateUploaded);
       final anyPermanentlyFailed = allChunks.any((c) => c.uploadState == QueuedChunk.stateFailed);
+      final allFinished = allChunks.isNotEmpty && allChunks.every((c) => c.uploadState == QueuedChunk.stateUploaded || c.uploadState == QueuedChunk.stateFailed);
       if (allUploaded) {
         await _complete();
-      } else if (anyPermanentlyFailed && afterPending.isEmpty) {
+      } else if (anyPermanentlyFailed && allFinished) {
         // Nothing left to retry, but not everything made it -- completing
         // is still correct per §I (the backend computes and surfaces
         // missing_chunk_numbers rather than blocking completion forever),
@@ -400,17 +519,60 @@ class RecordingService {
   // Stop / Cancel
   // ---------------------------------------------------------------------
 
-  /// Graceful stop: finalizes the current segment as the last chunk,
-  /// uploads everything, then calls /complete. Never discards footage
-  /// already captured.
+  /// Graceful stop. Returns as soon as the camera has genuinely stopped and
+  /// the final segment is safely persisted/enqueued locally -- it does NOT
+  /// wait for that (or any other) chunk to actually finish uploading, nor
+  /// for the recording to reach COMPLETED. Uploading and completion happen
+  /// asynchronously afterward (driven by the fire-and-forget _pump() calls
+  /// this triggers, plus the still-running periodic _pumpTimer as a
+  /// safety net) -- see _handleSegmentReady's matching doc comment for the
+  /// real bug this fixes. Never discards footage already captured.
   Future<void> stop() async {
     if (!isActive) return;
     _stopRequested = true;
     await _engine?.stop();
     // If the engine had no active segment (e.g. stop() called during the
     // narrow STARTING window), the segment-ready callback above will never
-    // fire, so nudge the pump directly to still attempt completion.
-    await _pump();
+    // fire, so nudge the pump directly to still attempt completion --
+    // fire-and-forget for the same reason as _handleSegmentReady's own
+    // _pump() call: this method must not block its caller on the upload
+    // queue draining.
+    unawaited(_pump().catchError((Object e) => onError?.call(e)));
+  }
+
+  // ---------------------------------------------------------------------
+  // Background pause / resume
+  // ---------------------------------------------------------------------
+
+  /// Call the instant the app is about to leave the foreground (see
+  /// home_screen.dart's WidgetsBindingObserver) -- kept as a real, called
+  /// method rather than removed, per the background/locked-recording
+  /// architecture brief's explicit instruction.
+  ///
+  /// UNDER THE CURRENT (native CameraX) ENGINE ARCHITECTURE this is a
+  /// deliberate no-op: RecordingEngine now proxies to a native camera
+  /// pipeline bound to its own Activity-independent LifecycleOwner (see
+  /// recording_engine.dart's top doc comment and
+  /// android/.../camera/RecordingLifecycleOwner.kt), so capture genuinely
+  /// continues through backgrounding/screen-lock and there is nothing to
+  /// pause -- entering [RecordingLifecycleState.backgroundPaused] here
+  /// would be actively misleading (home_screen.dart displays that state as
+  /// "Recording paused (app in background)", which would no longer be
+  /// true). [state] simply stays [RecordingLifecycleState.recording] (or
+  /// [RecordingLifecycleState.offline]) straight through backgrounding,
+  /// same as it already does for any other momentary UI-irrelevant
+  /// transition.
+  Future<void> pauseForBackground() async {
+    await _engine?.pauseForBackground();
+  }
+
+  /// Call when the app returns to the foreground after
+  /// [pauseForBackground] -- a no-op under the current engine architecture
+  /// for the same reason [pauseForBackground] is: see that method's doc
+  /// comment. Kept, not removed, for the same call-site-compatibility
+  /// reason.
+  Future<void> resumeFromBackground() async {
+    await _engine?.resumeFromBackground();
   }
 
   /// Explicit cancellation (docs/FLUTTER_API_HANDOFF.md §J) -- used when
@@ -465,27 +627,64 @@ class RecordingService {
     final unfinished = await OfflineQueueService.unfinishedSessions();
     for (final session in unfinished) {
       if (session.lifecycleState == RecordingLifecycleState.startFailed.name) continue;
+
+      // REAL BUG HARDENED HERE (background/locked-upload audit): the
+      // native camera pipeline is lifecycle-independent (see
+      // RecordingEngine's own doc comment) and keeps writing finished
+      // segment files to disk even if the Dart engine that would normally
+      // enqueue each one into OfflineQueueService gets torn down first --
+      // e.g. the OS (or an aggressive OEM background-app killer) kills the
+      // Flutter engine/Activity between a segment finishing natively and
+      // this app's Dart isolate processing the corresponding
+      // "segmentReady" platform-channel call for it. Without this scan,
+      // such a file sits on disk with no row in chunk_queue -- invisible
+      // to drain()/_pump()/the completion check, silently indistinguishable
+      // from evidence that was simply never captured. This recovers it as
+      // an ordinary pending chunk on the next app launch, exactly as if it
+      // had been enqueued the moment it was recorded.
+      await _recoverOrphanedSegmentFiles(session);
+
       final chunks = await OfflineQueueService.allChunksForSession(session.localSessionId);
-      final pending = chunks.where((c) => c.uploadState != QueuedChunk.stateUploaded).toList();
-      if (session.backendSessionId == null || pending.isEmpty) {
-        // Nothing uploadable, or no backend session was ever obtained --
-        // there's nothing more this recovery pass can safely do beyond
-        // what the next active RecordingService instance's own _pump
-        // would already retry once a new recording starts. Leave the row
-        // as-is; it remains visible/queryable for support/debugging.
+      var pending = chunks.where((c) => c.uploadState != QueuedChunk.stateUploaded).toList();
+
+      if (session.backendSessionId == null) {
+        // No backend session was ever obtained -- there's nothing this
+        // recovery pass can safely do beyond what the next active
+        // RecordingService instance's own _pump would already retry once
+        // a new recording starts. Leave the row as-is; it remains
+        // visible/queryable for support/debugging.
         continue;
       }
-      final uploader = ChunkUploader();
-      for (final chunk in pending) {
-        // Re-point stuck "uploading" rows (from a process death mid-upload)
-        // back to pending so drain() will actually pick them up.
-        if (chunk.uploadState == QueuedChunk.stateUploading) {
-          await OfflineQueueService.updateChunkState(chunk.id!, uploadState: QueuedChunk.statePending);
+
+      if (pending.isNotEmpty) {
+        final uploader = ChunkUploader();
+        for (final chunk in pending) {
+          // Re-point stuck "uploading" rows (from a process death mid-upload)
+          // back to pending so drain() will actually pick them up.
+          if (chunk.uploadState == QueuedChunk.stateUploading) {
+            await OfflineQueueService.updateChunkState(chunk.id!, uploadState: QueuedChunk.statePending);
+          }
         }
+        await uploader.drain();
+        pending = await OfflineQueueService.pendingChunks(localSessionId: session.localSessionId);
       }
-      await uploader.drain();
-      final remaining = await OfflineQueueService.pendingChunks(localSessionId: session.localSessionId);
-      if (remaining.isEmpty) {
+
+      if (pending.isEmpty) {
+        // REAL BUG FIXED HERE, physically reproduced (real Internet
+        // testing: all 6 chunks of a session -- including the final one --
+        // confirmed `upload_status=uploaded` server-side, yet the session
+        // stayed stuck at status=recording indefinitely). Root cause: this
+        // branch used to be folded into the same early-exit as "no backend
+        // session at all" whenever EVERY chunk was ALREADY uploaded before
+        // this recovery pass even began -- e.g. the app process died (OS
+        // kill, dead battery, OEM background-app killer) in the narrow
+        // window between the final chunk's upload succeeding and
+        // RecordingService._pump()'s own post-upload completion check
+        // running. The evidence was already 100% safely stored server-side;
+        // only the final status transition was ever missing. This now
+        // always attempts /complete whenever the local queue is (now, or
+        // already was) fully drained, not only when THIS pass did the
+        // draining.
         try {
           await RecordingApi.complete(session.backendSessionId!);
           onRecovered('Recovered and completed recording ${session.localSessionId} (${chunks.length} chunks)');
@@ -494,8 +693,52 @@ class RecordingService {
           // connectivity/auth allows -- never silently dropped.
         }
       } else {
-        onRecovered('Recording ${session.localSessionId} still has ${remaining.length} chunk(s) queued -- will resume on the next connectivity/app-start attempt');
+        onRecovered('Recording ${session.localSessionId} still has ${pending.length} chunk(s) queued -- will resume on the next connectivity/app-start attempt');
       }
+    }
+  }
+
+  /// Filenames are always `segment_NNNNNN.mp4` (zero-padded chunk number --
+  /// see NativeRecordingManager.kt's beginSegment(), the only place that
+  /// creates them). Duration/GPS/timestamp metadata for a recovered file is
+  /// unavailable (it was only ever computed by the native "segmentReady"
+  /// event this file's own enqueue call never received) -- sent as null/
+  /// unknown rather than guessed. is_last_chunk is always sent false: this
+  /// scan has no way to positively confirm a recovered file was genuinely
+  /// the session's true final segment (the process could have been killed
+  /// before capturing a later one too), and the completion path below
+  /// already calls /complete once the local queue is empty regardless of
+  /// any single chunk's is_last_chunk flag -- see chunk_manifest.py for how
+  /// the backend independently determines missing chunks either way.
+  static final RegExp _segmentFilePattern = RegExp(r'^segment_(\d{6})\.mp4$');
+
+  static Future<void> _recoverOrphanedSegmentFiles(LocalRecordingSession session) async {
+    final docsDir = await getApplicationDocumentsDirectory();
+    final sessionDir = Directory(p.join(docsDir.path, 'recordings', session.localSessionId));
+    if (!await sessionDir.exists()) return;
+
+    final existing = await OfflineQueueService.allChunksForSession(session.localSessionId);
+    final knownNumbers = existing.map((c) => c.chunkNumber).toSet();
+
+    await for (final entry in sessionDir.list()) {
+      if (entry is! File) continue;
+      final match = _segmentFilePattern.firstMatch(p.basename(entry.path));
+      if (match == null) continue;
+      final chunkNumber = int.parse(match.group(1)!);
+      if (knownNumbers.contains(chunkNumber)) continue;
+
+      await OfflineQueueService.enqueueChunk(QueuedChunk(
+        localSessionId: session.localSessionId,
+        backendSessionId: session.backendSessionId,
+        chunkNumber: chunkNumber,
+        localFilePath: entry.path,
+        durationSeconds: null,
+        isLastChunk: false,
+        uploadState: QueuedChunk.statePending,
+        retryCount: 0,
+        createdAt: DateTime.now(),
+      ));
+      knownNumbers.add(chunkNumber);
     }
   }
 

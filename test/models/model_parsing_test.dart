@@ -97,6 +97,13 @@ void main() {
       expect(session.triggerType, TriggerType.emergencyButton);
       expect(session.status, RecordingStatus.recording);
       expect(session.missingChunkNumbers, [2]);
+      expect(session.playableStatus, 'not_ready'); // field omitted above -- must default, never crash
+      expect(session.cameraLensDirection, 'back'); // field omitted above -- must default, never crash
+
+      final readyJson = {...json, 'playable_status': 'ready', 'camera_lens_direction': 'front'};
+      final readySession = RecordingSessionResponse.fromJson(readyJson);
+      expect(readySession.playableStatus, 'ready');
+      expect(readySession.cameraLensDirection, 'front');
     });
 
     test('RecordingManifestResponse.fromJson matches schemas.RecordingManifestResponse', () {
@@ -162,6 +169,54 @@ void main() {
       expect(RemoteCommandType.fromWire('stop_recording'), RemoteCommandType.stopRecording);
       expect(RemoteCommandType.fromWire('start_live_stream'), RemoteCommandType.startLiveStream);
       expect(RemoteCommandType.fromWire('stop_live_stream'), RemoteCommandType.stopLiveStream);
+    });
+  });
+
+  group('QueuedChunk (GPS/timestamp watermark fields)', () {
+    test('toDb/fromDb round-trips a real GPS fix + recordedAt losslessly', () {
+      final recordedAt = DateTime.utc(2026, 9, 16, 16, 24, 31);
+      final chunk = QueuedChunk(
+        id: 1,
+        localSessionId: 'local-1',
+        backendSessionId: 'rec-1',
+        chunkNumber: 1,
+        localFilePath: '/tmp/segment_1.mp4',
+        durationSeconds: 20.0,
+        isLastChunk: false,
+        uploadState: QueuedChunk.statePending,
+        retryCount: 0,
+        createdAt: DateTime.utc(2026, 9, 16, 16, 24, 51),
+        latitude: 16.5062,
+        longitude: 80.648,
+        recordedAt: recordedAt,
+      );
+
+      final restored = QueuedChunk.fromDb(chunk.toDb());
+
+      expect(restored.latitude, 16.5062);
+      expect(restored.longitude, 80.648);
+      expect(restored.recordedAt, recordedAt);
+    });
+
+    test('toDb/fromDb round-trips a genuinely GPS-unavailable chunk as null, never a fabricated 0.0', () {
+      final chunk = QueuedChunk(
+        id: 1,
+        localSessionId: 'local-1',
+        backendSessionId: 'rec-1',
+        chunkNumber: 1,
+        localFilePath: '/tmp/segment_1.mp4',
+        durationSeconds: 20.0,
+        isLastChunk: false,
+        uploadState: QueuedChunk.statePending,
+        retryCount: 0,
+        createdAt: DateTime.utc(2026, 9, 16, 16, 24, 51),
+      );
+
+      final restored = QueuedChunk.fromDb(chunk.toDb());
+
+      expect(restored.latitude, isNull);
+      expect(restored.longitude, isNull);
+      expect(restored.recordedAt, isNull);
     });
   });
 }

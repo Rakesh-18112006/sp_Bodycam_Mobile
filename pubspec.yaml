@@ -41,6 +41,14 @@ dependencies:
   web_socket_channel: ^3.0.3
   uuid: ^4.6.0
 
+  # Real playback of a completed recording's server-side concatenated file
+  # (GET /recordings/{id}/play) on the Recording Details screen.
+  # video_player is the Flutter-team-maintained core playback engine;
+  # chewie provides the ready-made Material controls (play/pause/seek/
+  # loading/error) on top of it, rather than hand-rolling that UI.
+  video_player: ^2.10.0
+  chewie: ^1.13.0
+
   # --- Body-camera recording stack -----------------------------------------
   camera: ^0.11.1               # real Android Camera2-backed video+audio recording
   path_provider: ^2.1.5         # per-app local storage for recorded segments
@@ -49,6 +57,14 @@ dependencies:
   geolocator: ^13.0.4            # real GPS location reporting
   battery_plus: ^6.2.1           # real battery percentage / charging state
   flutter_foreground_task: ^11.0.3  # Android foreground service so recording survives backgrounding
+
+  # Short local audio feedback (remote command beeps, charging connect/
+  # disconnect sounds -- see audio_feedback_service.dart). Chosen over
+  # heavier alternatives (just_audio) because PlayerMode.lowLatency uses
+  # Android's SoundPool, built for exactly this "short SFX, no big media
+  # session" case. No other audio-playback package existed in this project
+  # before this feature.
+  audioplayers: ^6.8.1
 
 dev_dependencies:
   flutter_test:
@@ -63,6 +79,13 @@ dev_dependencies:
   # dependency of web_socket_channel, declared directly here since a test
   # imports it explicitly.
   stream_channel: ^2.1.4
+  # Used only by test/services/recording_engine_test.dart and
+  # recording_service_test.dart to fake getApplicationDocumentsDirectory()
+  # (a real platform channel with no implementation in `flutter test`)
+  # without touching real platform channels -- already a transitive
+  # dependency of path_provider, declared directly here since tests import
+  # it explicitly.
+  path_provider_platform_interface: ^2.1.3
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -81,6 +104,16 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  # Short, locally-synthesized WAV tones for remote-command/charging audio
+  # feedback -- see assets/audio/generate_tones.py for how they were made
+  # (pure sine-wave synthesis, no downloaded/copyrighted audio) and
+  # audio_feedback_service.dart for how they're played.
+  assets:
+    - assets/audio/remote_start.wav
+    - assets/audio/remote_stop.wav
+    - assets/audio/charging_connected.wav
+    - assets/audio/charging_disconnected.wav
 
   # To add assets to your application, add an assets section, like this:
   # assets:
