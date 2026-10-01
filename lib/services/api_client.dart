@@ -8,15 +8,13 @@ import 'package:http_parser/http_parser.dart';
 /// `--dart-define=API_BASE_URL=http://<host>:8000` -- never hardcode a
 /// specific developer's LAN IP in source (see the original audit finding).
 ///
-/// Default is `10.0.2.2`, the standard Android-emulator alias for the host
-/// machine's `localhost` (docs/FLUTTER_API_HANDOFF.md §A). A physical
-/// device on the same network must override this with the host machine's
-/// real LAN IP, e.g.:
-///   flutter run --dart-define=API_BASE_URL=http://192.168.1.50:8000
-///   flutter build apk --dart-define=API_BASE_URL=https://bodycam.example.gov
+/// Defaults to the real deployed production backend (Render). Override
+/// for local/emulator development, e.g.:
+///   flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8000            # Android emulator
+///   flutter run --dart-define=API_BASE_URL=http://192.168.1.50:8000        # physical device, local backend
 const String kApiBaseUrl = String.fromEnvironment(
   'API_BASE_URL',
-  defaultValue: 'http://10.0.2.2:8000',
+  defaultValue: 'https://bodycam-backend-qo1e.onrender.com',
 );
 
 const _tokenKey = 'access_token';
