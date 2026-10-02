@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:camera/camera.dart' show CameraController, CameraLensDirection;
+import 'package:camera/camera.dart' show CameraLensDirection;
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -108,9 +108,9 @@ class RecordingService {
   CameraLensDirection _activeCameraLensDirection = CameraLensDirection.back;
 
   /// Read-only passthrough so the UI can render a REAL, live
-  /// `CameraPreview(controller)` -- see RecordingEngine.controller's doc
-  /// comment. Null whenever no engine is active.
-  CameraController? get cameraController => _engine?.controller;
+  /// `Texture(textureId: ...)` self-view -- see RecordingEngine.textureId's
+  /// doc comment. Null whenever no engine is active.
+  int? get previewTextureId => _engine?.textureId;
 
   final void Function(RecordingLifecycleState state)? onStateChanged;
   final void Function({required int uploaded, required int pending, required int failed})? onProgress;

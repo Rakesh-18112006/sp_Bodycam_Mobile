@@ -97,7 +97,7 @@ class MainActivity : FlutterActivity() {
         // runs (matches camera_android_camerax's own Activity-reattachment
         // pattern) so the manager always reports to the latest live channel.
         val recordingChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.policebodycam.recording")
-        NativeRecordingManager.attach(applicationContext, recordingChannel)
+        NativeRecordingManager.attach(applicationContext, recordingChannel, flutterEngine.renderer)
         recordingChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {

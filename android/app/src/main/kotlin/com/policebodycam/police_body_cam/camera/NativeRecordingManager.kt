@@ -4,7 +4,9 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Surface
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
@@ -16,6 +18,7 @@ import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.view.TextureRegistry
 import java.io.File
 
 /**
@@ -57,11 +60,21 @@ object NativeRecordingManager {
 
     private var appContext: Context? = null
     private var channel: MethodChannel? = null
+    private var textureRegistry: TextureRegistry? = null
 
     private var lifecycleOwner: RecordingLifecycleOwner? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var videoCapture: VideoCapture<Recorder>? = null
     private var activeRecording: Recording? = null
+
+    // Live on-screen self-view for the constable while recording (see
+    // home_screen.dart's `_recordingGoLiveCard`) -- a second CameraX use
+    // case bound alongside [videoCapture] above, sharing the same camera
+    // session. Rendered on the Dart side via a `Texture(textureId: ...)`
+    // widget backed by this SurfaceTextureEntry. Purely cosmetic: it never
+    // touches what gets recorded, only what the operator sees.
+    private var preview: Preview? = null
+    private var surfaceTextureEntry: TextureRegistry.SurfaceTextureEntry? = null
 
     private var sessionDir: String? = null
     private var segmentDurationMs: Long = 20000
@@ -124,14 +137,16 @@ object NativeRecordingManager {
      * and its BinaryMessenger stay valid across this, so simply pointing at
      * the latest channel instance is correct and sufficient.
      */
-    fun attach(context: Context, methodChannel: MethodChannel) {
+    fun attach(context: Context, methodChannel: MethodChannel, registry: TextureRegistry) {
         appContext = context.applicationContext
         channel = methodChannel
+        textureRegistry = registry
     }
 
     fun start(sessionDirPath: String, lensDirection: String, segDurationMs: Long, result: MethodChannel.Result) {
         val context = appContext
-        if (context == null) {
+        val registry = textureRegistry
+        if (context == null || registry == null) {
             result.error("NOT_ATTACHED", "NativeRecordingManager.attach() was never called", null)
             return
         }
@@ -149,6 +164,9 @@ object NativeRecordingManager {
         val owner = RecordingLifecycleOwner()
         lifecycleOwner = owner
         owner.start()
+
+        val entry = registry.createSurfaceTexture()
+        surfaceTextureEntry = entry
 
         val providerFuture = ProcessCameraProvider.getInstance(context)
         providerFuture.addListener({
@@ -169,11 +187,27 @@ object NativeRecordingManager {
                 val capture = VideoCapture.withOutput(recorder)
                 videoCapture = capture
 
+                // See this class's preview/surfaceTextureEntry doc comment.
+                // provideSurface's own callback is CameraX's documented way
+                // to know when it's safe to release the Surface -- e.g. on
+                // rebind/resolution-change -- never torn down eagerly here.
+                val surfaceTexture = entry.surfaceTexture()
+                val newPreview = Preview.Builder().build()
+                newPreview.setSurfaceProvider(ContextCompat.getMainExecutor(context)) { request ->
+                    val resolution = request.resolution
+                    surfaceTexture.setDefaultBufferSize(resolution.width, resolution.height)
+                    val surface = Surface(surfaceTexture)
+                    request.provideSurface(surface, ContextCompat.getMainExecutor(context)) {
+                        surface.release()
+                    }
+                }
+                preview = newPreview
+
                 provider.unbindAll()
-                provider.bindToLifecycle(owner, selector, capture)
+                provider.bindToLifecycle(owner, selector, capture, newPreview)
 
                 beginSegment()
-                result.success(mapOf("started" to true))
+                result.success(mapOf("started" to true, "textureId" to entry.id()))
             } catch (e: Exception) {
                 Log.e(TAG, "camera bind failed", e)
                 teardown()
@@ -296,6 +330,9 @@ object NativeRecordingManager {
         videoCapture = null
         activeRecording = null
         cameraProvider = null
+        preview = null
+        surfaceTextureEntry?.release()
+        surfaceTextureEntry = null
         rotating = false
     }
 }

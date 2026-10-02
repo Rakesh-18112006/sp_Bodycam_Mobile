@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:camera/camera.dart' show CameraController, CameraLensDirection;
+import 'package:camera/camera.dart' show CameraLensDirection;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
@@ -100,14 +100,15 @@ class RecordingEngine {
 
   bool get isRecording => _recording;
 
-  /// Native CameraX now owns the camera; there is no Dart-side
-  /// CameraController to expose for a live `CameraPreview(controller)`
-  /// widget any more -- always null. This is an intentional, documented
-  /// scope decision (see the migration's final report, "remaining
-  /// limitations"): it affects only the on-screen self-view during
-  /// recording, never the actual capture, chunking, or upload behavior,
-  /// which this whole migration is about.
-  CameraController? get controller => null;
+  /// Native CameraX owns the camera; there is no Dart-side CameraController
+  /// any more (see NativeRecordingManager.kt's doc comment for why camera
+  /// ownership moved to native code). The live on-screen self-view is
+  /// instead backed by a second CameraX `Preview` use case bound alongside
+  /// the actual recording one, rendered into a Flutter `Texture` via this
+  /// id -- set once native `start()` returns, null whenever no engine is
+  /// active or the native side couldn't provide one.
+  int? get textureId => _textureId;
+  int? _textureId;
 
   /// Initializes native camera capture (this is what triggers the real
   /// Android CAMERA/RECORD_AUDIO permission prompts on first use, via the
@@ -123,11 +124,12 @@ class RecordingEngine {
     _channel.setMethodCallHandler(_handleNativeCall);
 
     debugPrint('[bodycam] starting native recording, session=$localSessionId dir=${sessionDir.path}');
-    await _channel.invokeMethod<Map<Object?, Object?>>('start', {
+    final result = await _channel.invokeMethod<Map<Object?, Object?>>('start', {
       'sessionDir': sessionDir.path,
       'lensDirection': lensDirection == CameraLensDirection.front ? 'front' : 'back',
       'segmentDurationMs': segmentDuration.inMilliseconds,
     });
+    _textureId = (result?['textureId'] as num?)?.toInt();
     _recording = true;
   }
 
@@ -150,6 +152,7 @@ class RecordingEngine {
         ));
         if (isLast) {
           _recording = false;
+          _textureId = null;
           _resolvePendingStops();
         }
         break;
@@ -167,6 +170,7 @@ class RecordingEngine {
         // pending stop() uncompleted forever, hanging indefinitely.
         if (_pendingStops.isNotEmpty) {
           _recording = false;
+          _textureId = null;
           _resolvePendingStops();
         }
         break;

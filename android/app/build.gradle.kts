@@ -9,7 +9,12 @@ android {
     namespace = "com.policebodycam.police_body_cam"
     // flutter_secure_storage requires compileSdk 37+.
     compileSdk = maxOf(flutter.compileSdkVersion, 35)
-    ndkVersion = flutter.ndkVersion
+    // Pinned to the NDK version already present on this machine (see
+    // /opt/homebrew/share/android-commandlinetools/ndk) instead of
+    // flutter.ndkVersion's bundled default (28.2.13676358), whose
+    // side-by-side download from Google's SDK repo repeatedly timed out
+    // over this network.
+    ndkVersion = "27.1.12297006"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

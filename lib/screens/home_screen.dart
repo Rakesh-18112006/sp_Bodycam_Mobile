@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:camera/camera.dart' show CameraLensDirection, CameraPreview;
+import 'package:camera/camera.dart' show CameraLensDirection;
 import 'package:livekit_client/livekit_client.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import '../main.dart';
@@ -523,19 +523,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   /// The prominent, body-camera-style "Go-Live" recording view: a REAL
-  /// live camera preview (the exact same CameraController RecordingEngine
-  /// itself is recording from -- see RecordingService.cameraController's
-  /// doc comment; never a fake/static preview) with a clear recording
-  /// indicator, timer, GPS/time/camera, and upload status overlaid on top.
-  /// This is purely an on-screen UI overlay for the constable -- it does
-  /// NOT put any text into the recorded video file itself; that happens
-  /// server-side once each chunk uploads (see chunk_uploader.dart's doc
-  /// comment and routers/recordings.py::_burn_watermark_best_effort), so
-  /// what's shown here and what ends up burned into the video are computed
+  /// live camera preview (a CameraX `Preview` use case bound alongside the
+  /// actual recording one in native code -- see NativeRecordingManager.kt
+  /// -- rendered here via a Flutter `Texture`; never a fake/static preview)
+  /// with a clear recording indicator, timer, GPS/time/camera, and upload
+  /// status overlaid on top. This is purely an on-screen UI overlay for
+  /// the constable -- it does NOT put any text into the recorded video
+  /// file itself; that happens server-side once each chunk uploads (see
+  /// chunk_uploader.dart's doc comment and
+  /// routers/recordings.py::_burn_watermark_best_effort), so what's shown
+  /// here and what ends up burned into the video are computed
   /// independently but represent the same real, non-fabricated data.
   Widget _recordingGoLiveCard() {
-    final controller = _recording?.cameraController;
-    final previewReady = controller != null && controller.value.isInitialized;
+    final textureId = _recording?.previewTextureId;
+    final previewReady = textureId != null;
     final isEmergency = _recording?.activeTriggerType == TriggerType.emergencyButton;
     final statusLabel = recordingTopStatusLabel(state: _recordingState, isEmergency: isEmergency);
     final cameraLabel = cameraWatermarkLabel(_emergencyCameraLensDirection);
@@ -552,12 +553,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         child: Container(
           color: Colors.black,
           child: AspectRatio(
-            aspectRatio: previewReady ? controller.value.aspectRatio : 16 / 9,
+            // CameraX negotiates its own preview resolution natively; this
+            // widget isn't told it, so it uses a fixed, reasonable ratio
+            // rather than the real one -- the texture may be mildly
+            // stretched/cropped to fit, which is a cosmetic tradeoff only.
+            aspectRatio: 16 / 9,
             child: Stack(
               fit: StackFit.expand,
               children: [
                 if (previewReady)
-                  CameraPreview(controller)
+                  Texture(textureId: textureId)
                 else
                   const Center(child: CircularProgressIndicator(color: Colors.white)),
                 // Top: recording indicator + status + timer -- kept out of
