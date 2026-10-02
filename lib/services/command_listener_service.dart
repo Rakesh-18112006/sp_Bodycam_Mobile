@@ -15,9 +15,10 @@ enum CommandChannelStatus { disconnected, connecting, connected }
 /// reference implementation.
 ///
 /// Reacts to every RemoteCommandType the backend defines
-/// (start_recording/stop_recording/start_live_stream/stop_live_stream) --
-/// unlike the original implementation, which deliberately ignored the
-/// recording commands. An unrecognized future command_type is reported via
+/// (start_recording/stop_recording/start_live_stream/stop_live_stream/
+/// switch_camera_front/switch_camera_back) -- unlike the original
+/// implementation, which deliberately ignored the recording commands. An
+/// unrecognized future command_type is reported via
 /// [onUnknownCommand] rather than silently dropped or guessed at.
 class CommandListenerService {
   /// Swappable for tests (see test/services/command_listener_reconnect_test.dart)

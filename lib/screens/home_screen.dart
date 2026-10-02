@@ -286,6 +286,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             await _stopLive();
           }
           break;
+        case RemoteCommandType.switchCameraFront:
+        case RemoteCommandType.switchCameraBack:
+          await _handleRemoteSwitchCamera(type);
+          break;
       }
       // "SENT" != "EXECUTED" (implementation brief §14/§24): this line is
       // only reached once the corresponding action above has genuinely
@@ -329,6 +333,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     setState(() => _emergencyCameraLensDirection = cameraForVolumeTriggerAction(action)!);
     _startRecording(TriggerType.emergencyButton);
+  }
+
+  /// Control Room's remote equivalent of tapping the in-app front/back
+  /// selector (the SegmentedButton bound to _emergencyCameraLensDirection
+  /// below). Sets which camera the NEXT recording uses -- never rebinds
+  /// the camera mid-recording, same as the local volume-button trigger
+  /// (see volume_trigger_logic.dart's doc comment for why: avoids
+  /// corrupting the upload pipeline or creating a duplicate session). If a
+  /// recording is active when this arrives, it's stopped (matching what a
+  /// local trigger already does in that state) rather than silently
+  /// ignored or the hardware rebound out from under an in-flight segment.
+  Future<void> _handleRemoteSwitchCamera(RemoteCommandType type) async {
+    final direction = type == RemoteCommandType.switchCameraFront ? CameraLensDirection.front : CameraLensDirection.back;
+    setState(() => _emergencyCameraLensDirection = direction);
+    if (_recording != null && _recording!.isActive) {
+      await _recording!.stop();
+    }
   }
 
   Future<void> _startRecording(TriggerType trigger) async {

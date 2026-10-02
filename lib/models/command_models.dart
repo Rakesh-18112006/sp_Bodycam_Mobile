@@ -3,7 +3,9 @@ enum RemoteCommandType {
   startRecording('start_recording'),
   stopRecording('stop_recording'),
   startLiveStream('start_live_stream'),
-  stopLiveStream('stop_live_stream');
+  stopLiveStream('stop_live_stream'),
+  switchCameraFront('switch_camera_front'),
+  switchCameraBack('switch_camera_back');
 
   final String wire;
   const RemoteCommandType(this.wire);
