@@ -344,11 +344,28 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// recording is active when this arrives, it's stopped (matching what a
   /// local trigger already does in that state) rather than silently
   /// ignored or the hardware rebound out from under an in-flight segment.
+  ///
+  /// A LIVE STREAM is a completely separate camera pipeline (livekit_client's
+  /// own capture, not native CameraX -- see LiveStreamService's doc
+  /// comment) that genuinely CAN switch camera in place without
+  /// interrupting the stream, via the exact same switchCamera() the local
+  /// in-app front/back selector already uses. This previously only ever
+  /// updated the NEXT-recording preference and never touched an active
+  /// live view at all, so a remote "switch to front/back camera" while
+  /// Control Room was watching live had no visible effect whatsoever.
   Future<void> _handleRemoteSwitchCamera(RemoteCommandType type) async {
-    final direction = type == RemoteCommandType.switchCameraFront ? CameraLensDirection.front : CameraLensDirection.back;
+    final wantsFront = type == RemoteCommandType.switchCameraFront;
+    final direction = wantsFront ? CameraLensDirection.front : CameraLensDirection.back;
     setState(() => _emergencyCameraLensDirection = direction);
     if (_recording != null && _recording!.isActive) {
       await _recording!.stop();
+    }
+    if (_liveStream.isLive) {
+      final wantsPosition = wantsFront ? CameraPosition.front : CameraPosition.back;
+      if (_liveStream.cameraPosition != wantsPosition) {
+        await _liveStream.switchCamera();
+      }
+      if (mounted) setState(() => _selectedCameraPosition = _liveStream.cameraPosition);
     }
   }
 
