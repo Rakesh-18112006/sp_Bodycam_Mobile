@@ -96,6 +96,21 @@ class MainActivity : FlutterActivity() {
         // lifecycle at all. attach() is (re-)called every time this method
         // runs (matches camera_android_camerax's own Activity-reattachment
         // pattern) so the manager always reports to the latest live channel.
+        // Free space on the volume that holds recorded segments, for the
+        // Network Hopping storage warnings (lib/services/storage_status_service.dart).
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.policebodycam.police_body_cam/storage")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "freeBytes" -> try {
+                        val stat = android.os.StatFs(filesDir.absolutePath)
+                        result.success(stat.availableBytes)
+                    } catch (e: Exception) {
+                        result.error("STORAGE_UNAVAILABLE", e.message, null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
         val recordingChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.policebodycam.recording")
         NativeRecordingManager.attach(applicationContext, recordingChannel, flutterEngine.renderer)
         recordingChannel.setMethodCallHandler { call, result ->

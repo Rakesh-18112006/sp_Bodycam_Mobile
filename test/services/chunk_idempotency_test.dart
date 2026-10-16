@@ -191,7 +191,7 @@ void main() {
     expect(pending.first.uploadState, QueuedChunk.statePending);
   });
 
-  test('SocketException -> max retries exceeded -> stateFailed', () async {
+  test('SocketException -> never gives up (no retry cap): stays pending with persisted back-off', () async {
     final uploader = ChunkUploader();
     await _seedSession('session1');
     final chunkId = await OfflineQueueService.enqueueChunk(QueuedChunk(
@@ -211,10 +211,12 @@ void main() {
     });
 
     await uploader.drain();
-    final pending = await OfflineQueueService.pendingChunks();
-    expect(pending.length, 1);
+    final pending = await OfflineQueueService.unsentChunks();
+    expect(pending.length, 1, reason: 'a network failure must never abandon evidence, however many attempts have already been made');
     expect(pending.first.retryCount, 10);
-    expect(pending.first.uploadState, QueuedChunk.stateFailed);
+    expect(pending.first.uploadState, QueuedChunk.statePending);
+    expect(pending.first.nextAttemptAt, greaterThan(DateTime.now().millisecondsSinceEpoch), reason: 'the next attempt is scheduled (persisted back-off), not immediate');
+    expect(pending.first.lastError, startsWith('network_'));
   });
 
   test('5xx -> local file preserved', () async {

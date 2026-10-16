@@ -54,8 +54,9 @@ String recordingTopStatusLabel({required RecordingLifecycleState state, required
   }
 }
 
-String uploadStatusText({required int uploaded, required int pending, required int failed}) {
-  final allUploaded = pending == 0 && failed == 0 && uploaded > 0;
+String uploadStatusText({required int uploaded, required int pending, required int failed, int atReceiver = 0}) {
+  // "All uploaded" means the control room has every chunk. Chunks held only by a site receiver never count as uploaded.
+  final allUploaded = pending == 0 && failed == 0 && atReceiver == 0 && uploaded > 0;
   if (allUploaded) return '✓ All chunks uploaded';
-  return 'Upload: $uploaded uploaded, $pending pending${failed > 0 ? ', $failed failed' : ''}';
+  return 'Upload: $uploaded uploaded, $pending pending${atReceiver > 0 ? ', $atReceiver at site receiver (not yet at control room)' : ''}${failed > 0 ? ', $failed failed' : ''}';
 }

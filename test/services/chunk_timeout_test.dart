@@ -104,6 +104,8 @@ void main() {
     ApiClient.httpClient = http.Client(); // replaced below by a working mock
     var uploaded = false;
     ApiClient.httpClient = _RespondingClient(() => uploaded = true);
+    // The timed-out chunk is now (correctly) waiting out a persisted back-off; "Sync now" makes it due immediately.
+    await OfflineQueueService.clearBackoff();
     await uploader.drain().timeout(const Duration(seconds: 5));
 
     expect(uploaded, isTrue, reason: 'drain() must still be able to upload after a previous hang -- _draining must not stay wedged true');

@@ -34,14 +34,17 @@
     <uses-feature android:name="android.hardware.camera" android:required="true"/>
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
     <uses-feature android:name="android.hardware.microphone" android:required="true"/>
-    <!-- usesCleartextTraffic is for local http development ONLY (see
-         docs/FLUTTER_API_HANDOFF.md section N); remove once the backend
-         is served over HTTPS for any real deployment. -->
+    <!-- Cleartext (plain http) traffic is OFF in this main manifest, so release builds can only use https. Local http
+         development is re-enabled for DEBUG builds only, in android/app/src/debug/AndroidManifest.xml. The same applies to
+         site receivers: use HTTPS with a certificate the phone trusts
+         (see docs/BODYCAM_OFFLINE_TRANSPORT.md, "TLS / VPN"); plain http
+         to a receiver is for an isolated lab only. The app never disables
+         certificate validation. -->
     <application
         android:label="police_body_cam"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true">
+        android:usesCleartextTraffic="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

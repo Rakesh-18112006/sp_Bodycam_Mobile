@@ -139,6 +139,14 @@ class ApiClient {
   /// inline.
   static void Function()? onUnauthorized;
 
+  /// Network Hopping: when this returns true a 401 from the control room does
+  /// NOT trigger [onUnauthorized] (forced logout). An officer working offline
+  /// at a site under a valid offline grant must not be thrown out of the app
+  /// because the central access token expired while there was no backhaul;
+  /// the app re-authenticates the next time it is online. Null/false in
+  /// Online mode, which keeps the existing behaviour exactly.
+  static bool Function()? suppressUnauthorized;
+
   static Future<String?> getToken() async {
     if (_tokenCacheLoaded) return _cachedToken;
     final token = await tokenStore.read(_tokenKey);
@@ -228,7 +236,7 @@ class ApiClient {
       // the token and navigating to the login screen. We still throw below
       // so the immediate caller's try/catch also sees the failure and can
       // stop whatever it was doing (e.g. abort a chunk upload attempt).
-      onUnauthorized?.call();
+      if (suppressUnauthorized?.call() != true) onUnauthorized?.call();
     }
 
     String detail = 'Request failed (${response.statusCode})';

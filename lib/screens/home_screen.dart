@@ -17,7 +17,10 @@ import '../services/emergency_trigger_service.dart';
 import '../services/foreground_service.dart';
 import '../services/live_stream_service.dart';
 import '../services/location_service.dart';
+import '../services/network_hopping_service.dart';
+import '../services/nh_sync_coordinator.dart';
 import '../services/recording_service.dart';
+import '../services/storage_status_service.dart';
 import '../utils/remote_command_audio_logic.dart';
 import '../utils/volume_trigger_logic.dart';
 import '../utils/watermark_display.dart';
@@ -25,6 +28,7 @@ import '../theme/app_theme.dart';
 import '../widgets/status_chip.dart';
 import 'login_screen.dart';
 import 'my_recordings_screen.dart';
+import 'network_hopping_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -137,7 +141,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _init() async {
     try {
       _deviceIdentifier = await DeviceService.getOrCreateDeviceIdentifier();
-      final device = await DeviceService.register(deviceIdentifier: _deviceIdentifier!);
+      await NetworkHoppingService.instance.load();
+      DeviceResponse device;
+      try {
+        device = await DeviceService.register(deviceIdentifier: _deviceIdentifier!);
+      } catch (e) {
+        // At a site with no backhaul the control room cannot be reached to
+        // register. In Network Hopping mode the officer must still be able to
+        // record, so fall back to the last registration this phone made.
+        final cached = NetworkHoppingService.instance.enabled ? await DeviceService.cached() : null;
+        if (cached == null) rethrow;
+        device = cached;
+        if (mounted) setState(() => _error = 'Working offline: control room not reachable. Recording is available and will be sent to the site receiver.');
+      }
       _device = device;
 
       _battery.start();
@@ -205,11 +221,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           if (mounted) setState(() => _error = 'Received unrecognized command_type "$raw" -- ignored');
         },
       );
-      await _commandListener!.start();
-
       _uiTicker = Timer.periodic(const Duration(seconds: 1), (_) {
         if (mounted && _recording != null && _recording!.isActive) setState(() {});
       });
+      // Starts the grant renewal / receiver-sync loop (a no-op in Online mode
+      // unless video is still awaiting central confirmation).
+      NhSyncCoordinator.instance.start();
+      try {
+        await _commandListener!.start();
+      } catch (e) {
+        // The command channel needs the control room; being offline at a site
+        // must not take the rest of the app down with it.
+        if (mounted) setState(() => _error = 'Remote commands unavailable: $e');
+      }
     } catch (e) {
       setState(() => _error = e.toString());
     } finally {
@@ -533,6 +557,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     ApiClient.onUnauthorized = null;
+    NhSyncCoordinator.instance.stop();
     ForegroundRecordingService.onButtonPressed = null;
     _uiTicker?.cancel();
     _heartbeat?.stop();
@@ -550,6 +575,48 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // ---------------------------------------------------------------------
 
   String _deviceStatusLabel() => _device?.status ?? 'unknown';
+
+  /// Shown only in Network Hopping mode: where video is going and whether the
+  /// officer needs to do anything (grant, receiver, storage).
+  Widget _networkHoppingBanner() {
+    return ListenableBuilder(
+      listenable: Listenable.merge([NetworkHoppingService.instance, NhSyncCoordinator.instance]),
+      builder: (context, _) {
+        final nh = NetworkHoppingService.instance;
+        if (!nh.enabled) return const SizedBox.shrink();
+        final storage = NhSyncCoordinator.instance.storage;
+        final site = nh.activeSite;
+        final String text;
+        if (!nh.grantValid) {
+          text = 'Network Hopping: no valid offline grant. Connect to the control room to renew it.';
+        } else if (nh.receiverStatus == 'connected') {
+          text = 'Network Hopping: connected to the site receiver at ${site?.siteCode ?? ''}.';
+        } else {
+          text = 'Network Hopping: waiting for the site receiver. Recording continues and video is kept on this phone.';
+        }
+        final lowStorage = storage != null && (storage.level == StorageLevel.low || storage.level == StorageLevel.critical);
+        return Padding(
+          padding: const EdgeInsets.only(bottom: AppSpacing.md),
+          child: InkWell(
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const NetworkHoppingScreen())),
+            child: Container(
+              padding: const EdgeInsets.all(AppSpacing.md),
+              decoration: BoxDecoration(
+                color: (nh.grantValid && !lowStorage) ? AppColors.surface : AppColors.dangerBg,
+                borderRadius: BorderRadius.circular(AppRadii.sm),
+                border: Border.all(color: AppColors.border),
+              ),
+              child: Row(children: [
+                const Icon(Icons.cell_tower, size: 18),
+                const SizedBox(width: 8),
+                Expanded(child: Text(lowStorage ? '$text Phone storage is ${storage.level == StorageLevel.critical ? 'critically ' : ''}low.' : text)),
+              ]),
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   String _recordingDuration() {
     final started = _recording?.recordingStartedAt;
@@ -578,8 +645,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final isEmergency = _recording?.activeTriggerType == TriggerType.emergencyButton;
     final statusLabel = recordingTopStatusLabel(state: _recordingState, isEmergency: isEmergency);
     final cameraLabel = cameraWatermarkLabel(_emergencyCameraLensDirection);
-    final allUploaded = _chunksPending == 0 && _chunksFailed == 0 && _chunksUploaded > 0;
-    final uploadText = uploadStatusText(uploaded: _chunksUploaded, pending: _chunksPending, failed: _chunksFailed);
+    final atReceiver = _recording?.localAckedChunks ?? 0;
+    // "Fully uploaded" means the CONTROL ROOM has every chunk. Chunks held only by a site receiver are safe on site but not
+    // uploaded, so they block the all-uploaded state and are named separately.
+    final allUploaded = _chunksPending == 0 && _chunksFailed == 0 && atReceiver == 0 && _chunksUploaded > 0;
+    final uploadText = uploadStatusText(uploaded: _chunksUploaded, pending: _chunksPending, failed: _chunksFailed, atReceiver: atReceiver);
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(AppRadii.md),
@@ -729,6 +799,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         title: const Text('Body Camera'),
         actions: [
           IconButton(
+            icon: Icon(NetworkHoppingService.instance.enabled ? Icons.cell_tower : Icons.cell_tower_outlined),
+            tooltip: 'Network Hopping',
+            onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const NetworkHoppingScreen())).then((_) {
+              if (mounted) setState(() {});
+            }),
+          ),
+          IconButton(
             icon: const Icon(Icons.video_library_outlined),
             tooltip: 'My Recordings',
             onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const MyRecordingsScreen())),
@@ -742,6 +819,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              _networkHoppingBanner(),
               if (_error != null) ...[
                 Container(
                   padding: const EdgeInsets.all(AppSpacing.md),
