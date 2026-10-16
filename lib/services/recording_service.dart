@@ -8,8 +8,11 @@ import 'package:uuid/uuid.dart';
 import '../models/location_models.dart';
 import '../models/recording_models.dart';
 import 'api_client.dart';
+import 'package:crypto/crypto.dart' as crypto;
 import 'chunk_uploader.dart';
+import 'network_hopping_service.dart';
 import 'offline_queue_service.dart';
+import 'receiver_client.dart';
 import 'recording_engine.dart';
 
 /// Raw backend calls for the RecordingSession lifecycle -- kept separate
@@ -89,6 +92,12 @@ class RecordingService {
   late final ChunkUploader _uploader;
   String? _localSessionId;
   String? _backendSessionId;
+  // Network Hopping: true when THIS recording was started in Network Hopping
+  // mode with a valid offline grant. Such a recording is identified by its
+  // client-generated UUID (the local session id) from the first moment: it
+  // never needs the control room to start, which is the whole point.
+  bool _nhActive = false;
+  String? _siteId;
   bool _stopRequested = false;
   bool _cancelRequested = false;
   Timer? _pumpTimer;
@@ -115,6 +124,10 @@ class RecordingService {
   final void Function(RecordingLifecycleState state)? onStateChanged;
   final void Function({required int uploaded, required int pending, required int failed})? onProgress;
   final void Function(Object error)? onError;
+
+  /// Chunks of the CURRENT recording that a site receiver holds but the control room has not confirmed yet. Kept apart from
+  /// "uploaded" so the UI can never call a recording fully uploaded while any chunk exists only at the receiver.
+  int localAckedChunks = 0;
 
   /// Reads the app's EXISTING cached GPS fix (see location_service.dart's
   /// LocationService.lastFix) at the moment each segment finishes, so it
@@ -150,7 +163,12 @@ class RecordingService {
     final chunks = await OfflineQueueService.allChunksForSession(_localSessionId!);
     final uploaded = chunks.where((c) => c.uploadState == QueuedChunk.stateUploaded).length;
     final failed = chunks.where((c) => c.uploadState == QueuedChunk.stateFailed).length;
-    final pending = chunks.length - uploaded - failed;
+    final localAcked = chunks.where((c) => c.uploadState == QueuedChunk.stateLocalAcked).length;
+    // Receiver-acknowledged chunks are safe on site but not at the control
+    // room yet: counted as neither "uploaded" nor "pending" here (the Network
+    // Hopping screen shows them separately).
+    localAckedChunks = localAcked;
+    final pending = chunks.length - uploaded - failed - localAcked;
     onProgress!(uploaded: uploaded, pending: pending, failed: failed);
   }
 
@@ -181,17 +199,16 @@ class RecordingService {
     recordingStartedAt = DateTime.now();
     activeTriggerType = triggerType;
     _activeCameraLensDirection = cameraLensDirection;
+
+    final nh = NetworkHoppingService.instance;
+    await nh.load();
+    // Network Hopping only when the officer chose it AND holds a valid grant
+    // for a site; otherwise this is exactly the original Online flow.
+    _nhActive = nh.enabled && nh.grantValid && nh.activeSite != null;
+    _siteId = _nhActive ? nh.activeSite!.siteId : null;
     _setState(RecordingLifecycleState.starting);
 
-    await OfflineQueueService.upsertSession(LocalRecordingSession(
-      localSessionId: _localSessionId!,
-      backendSessionId: null,
-      deviceIdentifier: deviceIdentifier,
-      triggerType: triggerType,
-      lifecycleState: RecordingLifecycleState.starting.name,
-      startedAt: recordingStartedAt!,
-      endedAt: null,
-    ));
+    await OfflineQueueService.upsertSession(_sessionRow(RecordingLifecycleState.starting, endedAt: null));
 
     // Local capture must never be blocked on the network (§O), so the
     // backend session is resolved in the background (see _pump) rather
@@ -201,21 +218,14 @@ class RecordingService {
     // instead of a camera that starts recording evidence nobody can ever
     // attribute to a valid session.
     try {
-      await _resolveBackendSession(triggerType);
+      // A Network Hopping recording needs no control-room round trip to start.
+      if (!_nhActive) await _resolveBackendSession(triggerType);
     } on ApiException catch (e) {
       // A definitive (non-network) rejection: do not start the camera at
       // all -- there is no scenario where locally recording anyway helps
       // if the backend has already told us this device/trigger is invalid.
       _setState(RecordingLifecycleState.startFailed);
-      await OfflineQueueService.upsertSession(LocalRecordingSession(
-        localSessionId: _localSessionId!,
-        backendSessionId: null,
-        deviceIdentifier: deviceIdentifier,
-        triggerType: triggerType,
-        lifecycleState: RecordingLifecycleState.startFailed.name,
-        startedAt: recordingStartedAt!,
-        endedAt: DateTime.now(),
-      ));
+      await OfflineQueueService.upsertSession(_sessionRow(RecordingLifecycleState.startFailed, endedAt: DateTime.now()));
       onError?.call(e);
       return;
     } catch (_) {
@@ -239,15 +249,7 @@ class RecordingService {
       // platform genuinely failed to start -- this MUST surface as
       // START_FAILED, never as a silent no-op or a fake "recording" state.
       _setState(RecordingLifecycleState.startFailed);
-      await OfflineQueueService.upsertSession(LocalRecordingSession(
-        localSessionId: _localSessionId!,
-        backendSessionId: _backendSessionId,
-        deviceIdentifier: deviceIdentifier,
-        triggerType: triggerType,
-        lifecycleState: RecordingLifecycleState.startFailed.name,
-        startedAt: recordingStartedAt!,
-        endedAt: DateTime.now(),
-      ));
+      await OfflineQueueService.upsertSession(_sessionRow(RecordingLifecycleState.startFailed, endedAt: DateTime.now()));
       // REAL BUG, physically reproduced (11 stuck RecordingSession rows
       // found server-side, several created mere milliseconds-to-seconds
       // apart on the same device): _resolveBackendSession above may have
@@ -275,20 +277,25 @@ class RecordingService {
     }
 
     _setState(RecordingLifecycleState.recording);
-    await OfflineQueueService.upsertSession(LocalRecordingSession(
-      localSessionId: _localSessionId!,
-      backendSessionId: _backendSessionId,
-      deviceIdentifier: deviceIdentifier,
-      triggerType: triggerType,
-      lifecycleState: RecordingLifecycleState.recording.name,
-      startedAt: recordingStartedAt!,
-      endedAt: null,
-    ));
+    await OfflineQueueService.upsertSession(_sessionRow(RecordingLifecycleState.recording, endedAt: null));
 
     _currentPumpInterval = const Duration(seconds: 10);
     _pumpTimer?.cancel();
     _pumpTimer = Timer.periodic(_currentPumpInterval, (_) => _pump());
   }
+
+  LocalRecordingSession _sessionRow(RecordingLifecycleState lifecycle, {required DateTime? endedAt}) => LocalRecordingSession(
+        localSessionId: _localSessionId!,
+        backendSessionId: _backendSessionId,
+        deviceIdentifier: deviceIdentifier,
+        triggerType: activeTriggerType ?? TriggerType.manual,
+        lifecycleState: lifecycle.name,
+        startedAt: recordingStartedAt!,
+        endedAt: endedAt,
+        siteId: _siteId,
+        networkHopping: _nhActive,
+        cameraLens: _activeCameraLensDirection == CameraLensDirection.front ? 'front' : 'back',
+      );
 
   /// Looks for an already-active recording for this device before creating
   /// a new one. POST /recordings/start has no idempotency-key protection
@@ -350,6 +357,15 @@ class RecordingService {
     // Existing cached fix only -- never a fresh GPS request per segment
     // (see locationProvider's doc comment above).
     final fix = locationProvider?.call();
+    // Identity and SHA-256 are fixed the moment the segment is finalized, so
+    // any later corruption on the phone (or in transit) is detectable. If
+    // hashing fails here the uploader computes them before the first attempt.
+    String? sha;
+    int? size;
+    try {
+      sha = (await crypto.sha256.bind(segment.file.openRead()).first).toString();
+      size = await segment.file.length();
+    } catch (_) {}
     final chunk = QueuedChunk(
       localSessionId: _localSessionId!,
       backendSessionId: _backendSessionId,
@@ -363,6 +379,10 @@ class RecordingService {
       latitude: fix?.latitude,
       longitude: fix?.longitude,
       recordedAt: segment.startedAt,
+      chunkId: sha == null ? null : const Uuid().v4(),
+      sha256: sha,
+      sizeBytes: size,
+      siteId: _siteId,
     );
     await OfflineQueueService.enqueueChunk(chunk);
     debugPrint('[bodycam] chunk ${chunk.chunkNumber} queued for session=${_backendSessionId ?? "(unresolved)"}');
@@ -412,7 +432,7 @@ class RecordingService {
   Future<void> _pump() async {
     if (_localSessionId == null) return;
 
-    if (_backendSessionId == null) {
+    if (_backendSessionId == null && !_nhActive) {
       try {
         // We don't have the trigger_type handy here (only start() does),
         // but a still-null backend session id after start() only happens
@@ -433,11 +453,11 @@ class RecordingService {
       }
     }
 
-    final beforePending = await OfflineQueueService.pendingChunks(localSessionId: _localSessionId!);
+    final beforePending = await OfflineQueueService.unsentChunks(localSessionId: _localSessionId!);
     if (beforePending.isNotEmpty) {
       await _uploader.drain();
     }
-    final afterPending = await OfflineQueueService.pendingChunks(localSessionId: _localSessionId!);
+    final afterPending = await OfflineQueueService.unsentChunks(localSessionId: _localSessionId!);
     final stillFailingNetwork = afterPending.isNotEmpty && afterPending.length == beforePending.length && beforePending.isNotEmpty;
 
     if (stillFailingNetwork) {
@@ -455,18 +475,25 @@ class RecordingService {
 
     if (_stopRequested && !_cancelRequested) {
       final allChunks = await OfflineQueueService.allChunksForSession(_localSessionId!);
-      final allUploaded = allChunks.isNotEmpty && allChunks.every((c) => c.uploadState == QueuedChunk.stateUploaded);
+      bool settled(QueuedChunk c) => c.uploadState == QueuedChunk.stateUploaded || c.uploadState == QueuedChunk.stateLocalAcked;
+      final allUploaded = allChunks.isNotEmpty && allChunks.every(settled);
       final anyPermanentlyFailed = allChunks.any((c) => c.uploadState == QueuedChunk.stateFailed);
-      final allFinished = allChunks.isNotEmpty && allChunks.every((c) => c.uploadState == QueuedChunk.stateUploaded || c.uploadState == QueuedChunk.stateFailed);
-      if (allUploaded) {
-        await _complete();
-      } else if (anyPermanentlyFailed && allFinished) {
-        // Nothing left to retry, but not everything made it -- completing
-        // is still correct per §I (the backend computes and surfaces
-        // missing_chunk_numbers rather than blocking completion forever),
-        // it just won't be a fully continuous recording.
-        await _complete();
+      final allFinished = allChunks.isNotEmpty && allChunks.every((c) => settled(c) || c.uploadState == QueuedChunk.stateFailed);
+      // Chunks a receiver holds are completed THROUGH the receiver (which
+      // forwards the completion once it has forwarded the chunks). The phone
+      // must not complete the central recording itself while any chunk is
+      // still on a receiver: central would then refuse those chunks.
+      final viaReceiver = allChunks.any((c) => c.target == UploadTarget.receiver && settled(c));
+      if (allUploaded || (anyPermanentlyFailed && allFinished)) {
+        if (viaReceiver) {
+          await _completeViaReceiver(allChunks);
+        } else {
+          await _complete();
+        }
       }
+      // (When some chunks were permanently rejected, completing is still
+      // correct per §I: the backend computes and surfaces missing_chunk_numbers
+      // rather than blocking completion forever.)
     }
   }
 
@@ -489,11 +516,44 @@ class RecordingService {
     _pumpTimer = Timer.periodic(_currentPumpInterval, (_) => _pump());
   }
 
-  Future<void> _complete() async {
-    if (_backendSessionId == null) return;
+  /// Completes a recording whose chunks went to a site receiver.
+  Future<void> _completeViaReceiver(List<QueuedChunk> allChunks) async {
+    final session = await NetworkHoppingService.instance.receiverSession();
+    if (session == null) return; // receiver unreachable: the pump tries again; nothing is lost
+    final held = allChunks.where((c) => c.target == UploadTarget.receiver && (c.uploadState == QueuedChunk.stateLocalAcked || c.uploadState == QueuedChunk.stateUploaded)).length;
     _setState(RecordingLifecycleState.completing);
     try {
-      final result = await RecordingApi.complete(_backendSessionId!);
+      await ReceiverClient.complete(session, recordingId: _localSessionId!, chunkCount: held, endedAt: DateTime.now());
+      _setState(RecordingLifecycleState.completed);
+      _pumpTimer?.cancel();
+      final local = await OfflineQueueService.getSession(_localSessionId!);
+      if (local != null) {
+        await OfflineQueueService.upsertSession(local.copyWith(lifecycleState: RecordingLifecycleState.completed.name, endedAt: DateTime.now()));
+      }
+    } on ReceiverException catch (e) {
+      if (e.code == 'chunks_outstanding') {
+        // The receiver is missing chunks the phone believed it had (e.g. the
+        // receiver's disk was replaced): send them again. The local files are
+        // still here because nothing is deleted before central confirmation.
+        await OfflineQueueService.requeueReceiverAcked(_localSessionId!);
+      }
+      NetworkHoppingService.instance.invalidateSession();
+      _setState(RecordingLifecycleState.completeFailed);
+      onError?.call(e);
+    } catch (e) {
+      _setState(RecordingLifecycleState.completeFailed);
+      onError?.call(e);
+    }
+  }
+
+  Future<void> _complete() async {
+    // A Network Hopping recording uploaded straight to the control room is
+    // registered under its own client UUID (see ChunkUploader._ensureCentralSession).
+    final centralId = _backendSessionId ?? (_nhActive ? _localSessionId : null);
+    if (centralId == null) return;
+    _setState(RecordingLifecycleState.completing);
+    try {
+      final result = await RecordingApi.complete(centralId);
       lastMissingChunkNumbers = result.missingChunkNumbers;
       _setState(RecordingLifecycleState.completed);
       _pumpTimer?.cancel();
@@ -589,9 +649,9 @@ class RecordingService {
     _pumpTimer?.cancel();
     await _engine?.stop();
     if (_localSessionId != null) {
-      final chunks = await OfflineQueueService.pendingChunks(localSessionId: _localSessionId!);
+      final chunks = await OfflineQueueService.unsentChunks(localSessionId: _localSessionId!);
       for (final c in chunks) {
-        await OfflineQueueService.updateChunkState(c.id!, uploadState: QueuedChunk.stateFailed);
+        await OfflineQueueService.updateChunkState(c.id!, uploadState: QueuedChunk.stateFailed, lastError: 'recording_cancelled');
       }
     }
     try {
@@ -645,9 +705,9 @@ class RecordingService {
       await _recoverOrphanedSegmentFiles(session);
 
       final chunks = await OfflineQueueService.allChunksForSession(session.localSessionId);
-      var pending = chunks.where((c) => c.uploadState != QueuedChunk.stateUploaded).toList();
+      var pending = chunks.where((c) => c.uploadState == QueuedChunk.statePending || c.uploadState == QueuedChunk.stateUploading).toList();
 
-      if (session.backendSessionId == null) {
+      if (session.backendSessionId == null && !session.networkHopping) {
         // No backend session was ever obtained -- there's nothing this
         // recovery pass can safely do beyond what the next active
         // RecordingService instance's own _pump would already retry once
@@ -666,10 +726,32 @@ class RecordingService {
           }
         }
         await uploader.drain();
-        pending = await OfflineQueueService.pendingChunks(localSessionId: session.localSessionId);
+        pending = await OfflineQueueService.unsentChunks(localSessionId: session.localSessionId);
       }
 
-      if (pending.isEmpty) {
+      if (pending.isEmpty && session.networkHopping) {
+        final all = await OfflineQueueService.allChunksForSession(session.localSessionId);
+        final viaReceiver = all.any((c) => c.target == UploadTarget.receiver);
+        try {
+          if (viaReceiver) {
+            final rs = await NetworkHoppingService.instance.receiverSession();
+            if (rs != null) {
+              final held = all.where((c) => c.target == UploadTarget.receiver && c.uploadState != QueuedChunk.stateFailed).length;
+              await ReceiverClient.complete(rs, recordingId: session.localSessionId, chunkCount: held, endedAt: session.endedAt ?? DateTime.now());
+              final local = await OfflineQueueService.getSession(session.localSessionId);
+              if (local != null) {
+                await OfflineQueueService.upsertSession(local.copyWith(lifecycleState: RecordingLifecycleState.completed.name, endedAt: DateTime.now()));
+              }
+              onRecovered('Recovered and completed recording ${session.localSessionId} via the site receiver (${all.length} chunks)');
+            }
+          } else if (all.isNotEmpty) {
+            await RecordingApi.complete(session.localSessionId);
+            onRecovered('Recovered and completed recording ${session.localSessionId} (${all.length} chunks)');
+          }
+        } catch (_) {
+          // retried at the next app start or sync cycle
+        }
+      } else if (pending.isEmpty) {
         // REAL BUG FIXED HERE, physically reproduced (real Internet
         // testing: all 6 chunks of a session -- including the final one --
         // confirmed `upload_status=uploaded` server-side, yet the session

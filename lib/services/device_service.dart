@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:uuid/uuid.dart';
 import 'api_client.dart';
 import '../models/device_models.dart';
@@ -22,7 +23,25 @@ class DeviceService {
       'app_version': '1.0.0',
       if (deviceModel != null) 'device_model': deviceModel,
     });
+    // Remembered so the app can start (and record) with no connectivity at a
+    // site in Network Hopping mode. Never used while the control room answers.
+    try {
+      await ApiClient.tokenStore.write(_deviceCacheKey, jsonEncode(result));
+    } catch (_) {}
     return DeviceResponse.fromJson(result as Map<String, dynamic>);
+  }
+
+  static const _deviceCacheKey = 'device_registration_cache';
+
+  /// The last successful registration response, or null if there was none.
+  static Future<DeviceResponse?> cached() async {
+    try {
+      final raw = await ApiClient.tokenStore.read(_deviceCacheKey);
+      if (raw == null) return null;
+      return DeviceResponse.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+    } catch (_) {
+      return null;
+    }
   }
 
   static Future<DeviceResponse> heartbeat({required String deviceIdentifier, int? batteryPercent, bool? isCharging}) async {

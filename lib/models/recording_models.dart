@@ -97,6 +97,11 @@ class VideoChunkResponse {
   final bool isLastChunk;
   final String uploadStatus;
   final DateTime createdAt;
+  // SHA-256 of the bytes exactly as the phone sent them (the preserved
+  // original). Network Hopping uses it to confirm the control room holds
+  // identical content before the phone deletes its local copy. Null for
+  // chunks stored by an older backend.
+  final String? originalHash;
 
   VideoChunkResponse({
     required this.id,
@@ -109,6 +114,7 @@ class VideoChunkResponse {
     required this.isLastChunk,
     required this.uploadStatus,
     required this.createdAt,
+    this.originalHash,
   });
 
   factory VideoChunkResponse.fromJson(Map<String, dynamic> json) => VideoChunkResponse(
@@ -122,6 +128,7 @@ class VideoChunkResponse {
         isLastChunk: json['is_last_chunk'] as bool,
         uploadStatus: json['upload_status'] as String,
         createdAt: DateTime.parse(json['created_at'] as String),
+        originalHash: json['original_hash'] as String?,
       );
 }
 
@@ -207,9 +214,32 @@ class QueuedChunk {
   final double? longitude;
   final DateTime? recordedAt;
 
+  // --- Network Hopping / integrity fields (queue schema v3) ----------------
+  // Client-generated chunk identity, stable across every retry and target.
+  final String? chunkId;
+  // SHA-256 of the segment file, computed on the phone before the first
+  // upload attempt. The receiver and the control room both verify it.
+  final String? sha256;
+  final int? sizeBytes;
+  // Where this chunk was last accepted: 'receiver' | 'central'.
+  final String? target;
+  final String? siteId;
+  // Epoch milliseconds before which this chunk must not be retried
+  // (persisted exponential back-off; survives app restarts).
+  final int nextAttemptAt;
+  final String? lastError;
+  final DateTime? localAckAt;
+
   static const statePending = 'pending';
   static const stateUploading = 'uploading';
+  // Accepted and durably stored by the site receiver, NOT yet confirmed by the
+  // control room. The local file is kept in this state.
+  static const stateLocalAcked = 'local_acked';
+  // Confirmed by the control room (direct upload, or reconciled against the
+  // central manifest). Only now may the local file be deleted.
   static const stateUploaded = 'uploaded';
+  // Permanently rejected (conflict, corruption, forbidden). The local file is
+  // preserved. Network failures NEVER put a chunk here.
   static const stateFailed = 'failed';
 
   QueuedChunk({
@@ -226,9 +256,30 @@ class QueuedChunk {
     this.latitude,
     this.longitude,
     this.recordedAt,
+    this.chunkId,
+    this.sha256,
+    this.sizeBytes,
+    this.target,
+    this.siteId,
+    this.nextAttemptAt = 0,
+    this.lastError,
+    this.localAckAt,
   });
 
-  QueuedChunk copyWith({int? id, String? backendSessionId, String? uploadState, int? retryCount}) => QueuedChunk(
+  QueuedChunk copyWith({
+    int? id,
+    String? backendSessionId,
+    String? uploadState,
+    int? retryCount,
+    String? chunkId,
+    String? sha256,
+    int? sizeBytes,
+    String? target,
+    int? nextAttemptAt,
+    String? lastError,
+    DateTime? localAckAt,
+  }) =>
+      QueuedChunk(
         id: id ?? this.id,
         localSessionId: localSessionId,
         backendSessionId: backendSessionId ?? this.backendSessionId,
@@ -242,6 +293,14 @@ class QueuedChunk {
         latitude: latitude,
         longitude: longitude,
         recordedAt: recordedAt,
+        chunkId: chunkId ?? this.chunkId,
+        sha256: sha256 ?? this.sha256,
+        sizeBytes: sizeBytes ?? this.sizeBytes,
+        target: target ?? this.target,
+        siteId: siteId,
+        nextAttemptAt: nextAttemptAt ?? this.nextAttemptAt,
+        lastError: lastError ?? this.lastError,
+        localAckAt: localAckAt ?? this.localAckAt,
       );
 
   Map<String, dynamic> toDb() => {
@@ -258,6 +317,14 @@ class QueuedChunk {
         'latitude': latitude,
         'longitude': longitude,
         'recorded_at': recordedAt?.toIso8601String(),
+        'chunk_id': chunkId,
+        'sha256': sha256,
+        'size_bytes': sizeBytes,
+        'target': target,
+        'site_id': siteId,
+        'next_attempt_at': nextAttemptAt,
+        'last_error': lastError,
+        'local_ack_at': localAckAt?.toIso8601String(),
       };
 
   factory QueuedChunk.fromDb(Map<String, dynamic> row) => QueuedChunk(
@@ -274,6 +341,14 @@ class QueuedChunk {
         latitude: (row['latitude'] as num?)?.toDouble(),
         longitude: (row['longitude'] as num?)?.toDouble(),
         recordedAt: row['recorded_at'] == null ? null : DateTime.parse(row['recorded_at'] as String),
+        chunkId: row['chunk_id'] as String?,
+        sha256: row['sha256'] as String?,
+        sizeBytes: row['size_bytes'] as int?,
+        target: row['target'] as String?,
+        siteId: row['site_id'] as String?,
+        nextAttemptAt: (row['next_attempt_at'] as int?) ?? 0,
+        lastError: row['last_error'] as String?,
+        localAckAt: row['local_ack_at'] == null ? null : DateTime.parse(row['local_ack_at'] as String),
       );
 }
 
@@ -288,6 +363,11 @@ class LocalRecordingSession {
   final String lifecycleState; // RecordingLifecycleState.name
   final DateTime startedAt;
   final DateTime? endedAt;
+  // Network Hopping: the site this recording belongs to (null in Online mode)
+  // and the lens used (needed to register the recording with a receiver).
+  final String? siteId;
+  final bool networkHopping;
+  final String cameraLens;
 
   LocalRecordingSession({
     required this.localSessionId,
@@ -297,6 +377,9 @@ class LocalRecordingSession {
     required this.lifecycleState,
     required this.startedAt,
     required this.endedAt,
+    this.siteId,
+    this.networkHopping = false,
+    this.cameraLens = 'back',
   });
 
   LocalRecordingSession copyWith({String? backendSessionId, String? lifecycleState, DateTime? endedAt}) => LocalRecordingSession(
@@ -307,6 +390,9 @@ class LocalRecordingSession {
         lifecycleState: lifecycleState ?? this.lifecycleState,
         startedAt: startedAt,
         endedAt: endedAt ?? this.endedAt,
+        siteId: siteId,
+        networkHopping: networkHopping,
+        cameraLens: cameraLens,
       );
 
   Map<String, dynamic> toDb() => {
@@ -317,6 +403,9 @@ class LocalRecordingSession {
         'lifecycle_state': lifecycleState,
         'started_at': startedAt.toIso8601String(),
         'ended_at': endedAt?.toIso8601String(),
+        'site_id': siteId,
+        'nh_mode': networkHopping ? 1 : 0,
+        'camera_lens': cameraLens,
       };
 
   factory LocalRecordingSession.fromDb(Map<String, dynamic> row) => LocalRecordingSession(
@@ -327,5 +416,8 @@ class LocalRecordingSession {
         lifecycleState: row['lifecycle_state'] as String,
         startedAt: DateTime.parse(row['started_at'] as String),
         endedAt: row['ended_at'] == null ? null : DateTime.parse(row['ended_at'] as String),
+        siteId: row['site_id'] as String?,
+        networkHopping: ((row['nh_mode'] as int?) ?? 0) == 1,
+        cameraLens: (row['camera_lens'] as String?) ?? 'back',
       );
 }

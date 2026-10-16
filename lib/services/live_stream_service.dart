@@ -1,5 +1,17 @@
 import 'package:livekit_client/livekit_client.dart';
 import 'api_client.dart';
+import 'network_hopping_service.dart';
+import 'receiver_client.dart';
+
+/// Live view cannot be provided right now (Network Hopping with no site-local
+/// live service and no route to the control room). Recording and chunk upload
+/// are NOT affected by this; the message says so.
+class LiveUnavailableException implements Exception {
+  final String message;
+  LiveUnavailableException(this.message);
+  @override
+  String toString() => message;
+}
 
 /// Ephemeral, publish-only live camera streaming -- nothing here is ever
 /// recorded or written to disk. Wraps the two backend endpoints
@@ -9,6 +21,9 @@ class LiveStreamService {
   Room? _room;
   String? sessionId;
   CameraPosition _cameraPosition = CameraPosition.back;
+  // True when this live view is published to a site-local LiveKit through a
+  // receiver (no control-room session exists to stop afterwards).
+  bool _siteLocal = false;
 
   bool get isLive => _room != null;
   CameraPosition get cameraPosition => _cameraPosition;
@@ -25,11 +40,39 @@ class LiveStreamService {
     String? triggeringCommandId,
     CameraPosition cameraPosition = CameraPosition.back,
   }) async {
-    final result = await ApiClient.post(
-      '/devices/$deviceId/live-stream/start',
-      body: {if (triggeringCommandId != null) 'triggering_command_id': triggeringCommandId},
-    );
-    sessionId = result['session']['id'];
+    final nh = NetworkHoppingService.instance;
+    await nh.load();
+    Map<String, dynamic>? result;
+    _siteLocal = false;
+    if (nh.enabled && nh.grantValid) {
+      // Network Hopping: prefer the site-local live service the receiver
+      // fronts. It is only as live as the site LAN; nothing is routed to the
+      // control room that cannot be reached.
+      final session = await nh.receiverSession();
+      if (session != null) {
+        try {
+          final r = await ReceiverClient.liveStart(session);
+          result = {'livekit_url': r['livekit_url'], 'token': r['token']};
+          _siteLocal = true;
+        } on ReceiverException catch (e) {
+          if (e.code != 'local_live_not_configured') {
+            throw LiveUnavailableException('Site live view refused: ${e.message}. Recording is unaffected.');
+          }
+        }
+      }
+      if (result == null && !await nh.centralReachable()) {
+        throw LiveUnavailableException(
+            'Live view is unavailable: this site has no local live service and the control room cannot be reached. Recording and upload to the site receiver continue normally.');
+      }
+    }
+    if (result == null) {
+      final central = await ApiClient.post(
+        '/devices/$deviceId/live-stream/start',
+        body: {if (triggeringCommandId != null) 'triggering_command_id': triggeringCommandId},
+      );
+      sessionId = central['session']['id'];
+      result = {'livekit_url': central['livekit_url'], 'token': central['token']};
+    }
     _cameraPosition = cameraPosition;
 
     final room = Room();
@@ -47,8 +90,8 @@ class LiveStreamService {
     // ICE/STUN/TURN behavior itself is changed) gives slower real-world
     // networks enough time without masking a genuine failure indefinitely.
     await room.connect(
-      result['livekit_url'],
-      result['token'],
+      result['livekit_url'] as String,
+      result['token'] as String,
       connectOptions: const ConnectOptions(
         timeouts: Timeouts(
           connection: Duration(seconds: 30),
@@ -104,9 +147,10 @@ class LiveStreamService {
     final id = sessionId;
     await _room?.disconnect();
     _room = null;
-    if (id != null) {
+    if (id != null && !_siteLocal) {
       await ApiClient.post('/live-stream/$id/stop');
     }
+    _siteLocal = false;
     sessionId = null;
   }
 }

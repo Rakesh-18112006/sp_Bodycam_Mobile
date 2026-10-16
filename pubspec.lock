@@ -218,7 +218,7 @@ packages:
     source: hosted
     version: "0.3.5+5"
   crypto:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: crypto
       sha256: c8ea0233063ba03258fbcf2ca4d6dadfefe14f02fab57702265467a19f27fadf
@@ -242,7 +242,7 @@ packages:
     source: hosted
     version: "1.0.9"
   dart_jsonwebtoken:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: dart_jsonwebtoken
       sha256: ad84e60181696513d04d5f2078e0bbc20365b911f46f647797317414bdc88fbe

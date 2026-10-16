@@ -40,6 +40,8 @@ dependencies:
   flutter_secure_storage: ^9.2.2
   web_socket_channel: ^3.0.3
   uuid: ^4.6.0
+  crypto: ^3.0.3                 # SHA-256 of every recorded chunk (Network Hopping integrity)
+  dart_jsonwebtoken: ^3.3.2     # ES256 verification of offline grants on the phone (lib/services/grant_verifier.dart)
 
   # Real playback of a completed recording's server-side concatenated file
   # (GET /recordings/{id}/play) on the Recording Details screen.
