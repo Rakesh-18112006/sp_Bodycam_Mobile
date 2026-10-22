@@ -17,6 +17,7 @@ import '../services/emergency_trigger_service.dart';
 import '../services/foreground_service.dart';
 import '../services/live_stream_service.dart';
 import '../services/location_service.dart';
+import '../services/network_alert_service.dart';
 import '../services/network_hopping_service.dart';
 import '../services/nh_sync_coordinator.dart';
 import '../services/recording_service.dart';
@@ -29,6 +30,7 @@ import '../widgets/status_chip.dart';
 import 'login_screen.dart';
 import 'my_recordings_screen.dart';
 import 'network_hopping_screen.dart';
+import 'network_login_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -139,6 +141,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _init() async {
+    // Network login / building alerts only need the officer's login, so they start first and independently: a slow device
+    // registration or an offline control room must not delay the alert channel.
+    unawaited(NetworkAlertService.instance.start());
     try {
       _deviceIdentifier = await DeviceService.getOrCreateDeviceIdentifier();
       await NetworkHoppingService.instance.load();
@@ -546,6 +551,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _battery.stop();
     _location?.stop();
     _commandListener?.stop();
+    NetworkAlertService.instance.stop();
     if (_liveStream.isLive) await _liveStream.stop();
     await ForegroundRecordingService.stop();
     await AuthService.logout();
@@ -798,6 +804,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('Body Camera'),
         actions: [
+          ListenableBuilder(
+            listenable: NetworkAlertService.instance,
+            builder: (context, _) => IconButton(
+              key: const Key('network-login-button'),
+              icon: Icon(NetworkAlertService.instance.isLoggedInAnywhere ? Icons.wifi : Icons.wifi_off),
+              tooltip: 'Network login',
+              onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const NetworkLoginScreen())),
+            ),
+          ),
           IconButton(
             icon: Icon(NetworkHoppingService.instance.enabled ? Icons.cell_tower : Icons.cell_tower_outlined),
             tooltip: 'Network Hopping',

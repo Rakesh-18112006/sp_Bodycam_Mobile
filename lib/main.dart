@@ -2,6 +2,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'services/auth_service.dart';
+import 'services/network_alert_service.dart';
+import 'widgets/network_alert_host.dart';
 import 'services/recording_service.dart';
 import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
@@ -16,6 +18,7 @@ import 'theme/app_theme.dart';
 final GlobalKey<NavigatorState> rootNavigatorKey = GlobalKey<NavigatorState>();
 
 Future<void> forceLogoutAndReturnToLogin() async {
+  NetworkAlertService.instance.stop();
   await AuthService.logout();
   rootNavigatorKey.currentState?.pushAndRemoveUntil(
     MaterialPageRoute(builder: (_) => const LoginScreen()),
@@ -64,6 +67,8 @@ class _PoliceBodyCamAppState extends State<PoliceBodyCamApp> {
       navigatorKey: rootNavigatorKey,
       title: 'Police Body Camera',
       theme: buildAppTheme(),
+      // Full-screen red building alert on top of every screen (see NetworkAlertService).
+      builder: (context, child) => NetworkAlertHost(child: child ?? const SizedBox.shrink()),
       home: FutureBuilder<bool>(
         future: _bootstrapFuture,
         builder: (context, snapshot) {
