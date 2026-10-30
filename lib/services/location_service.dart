@@ -23,6 +23,9 @@ class LocationService {
   Timer? _periodicResendTimer;
   LocationAvailability availability = LocationAvailability.unknown;
   GpsFix? lastFix;
+  // Per-duty-session counter the backend uses to order/de-duplicate fixes.
+  // Reset each time reporting (re)starts.
+  int _sequence = 0;
 
   final void Function(LocationAvailability availability)? onAvailabilityChanged;
   final void Function(Object error)? onError;
@@ -57,6 +60,7 @@ class LocationService {
     }
 
     _setAvailability(LocationAvailability.available);
+    _sequence = 0;
     _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
@@ -100,7 +104,11 @@ class LocationService {
       await ApiClient.post('/constables/me/location', body: {
         'latitude': fix.latitude,
         'longitude': fix.longitude,
-        if (fix.accuracy != null) 'accuracy': fix.accuracy,
+        // Backend requires accuracy; geolocator always returns one, but
+        // fall back to 0 rather than omit the required field.
+        'accuracy': fix.accuracy ?? 0,
+        'recorded_at': fix.capturedAt.toUtc().toIso8601String(),
+        'sequence_number': _sequence++,
       });
     } catch (e) {
       onError?.call(e);

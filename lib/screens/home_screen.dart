@@ -166,6 +166,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await ForegroundRecordingService.ensureReady();
       ForegroundRecordingService.onButtonPressed = _handleNotificationButton;
 
+      // The backend now requires an active duty session before it will
+      // accept location fixes (POST /constables/me/location -> 409
+      // no_active_duty_session otherwise). Start one as soon as the device
+      // is registered; a 409 here just means one is already active for
+      // this device (e.g. the app was killed and relaunched without a
+      // clean stop) and is harmless to ignore. Best-effort -- at a site
+      // with no backhaul this call simply fails like any other network
+      // call and location reporting stays unavailable until connectivity
+      // returns, same as every other online-only feature here.
+      try {
+        await ApiClient.post('/constables/me/duty-session/start', body: {
+          'device_identifier': _deviceIdentifier!,
+        });
+      } catch (e) {
+        if (e is! ApiException || !e.isConflict) {
+          if (mounted) setState(() => _error = 'Duty session: $e');
+        }
+      }
+
       _location = LocationService(
         onAvailabilityChanged: (a) {
           if (mounted) setState(() => _locationAvailability = a);
@@ -548,6 +567,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _commandListener?.stop();
     if (_liveStream.isLive) await _liveStream.stop();
     await ForegroundRecordingService.stop();
+    try {
+      await ApiClient.post('/constables/me/duty-session/stop');
+    } catch (_) {
+      // Non-fatal -- logging out must never be blocked by this.
+    }
     await AuthService.logout();
     if (!mounted) return;
     Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const LoginScreen()));
